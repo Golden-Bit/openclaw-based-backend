@@ -19,44 +19,9 @@ echo "Waiting Keycloak..."
 
 # ---- helpers ----
 
-http_json() {
-  # Usage: http_json METHOD URL [JSON_BODY]
-  # Prints body to stdout. Returns non-zero if status >= 400.
-  local method="$1"
-  local url="$2"
-  local body="${3:-}"
-
-  local tmp_body
-  tmp_body="$(mktemp)"
-
-  local status
-  if [[ -n "$body" ]]; then
-    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
-      -H "Content-Type: application/json" \
-      "$url" \
-      -d "$body")"
-  else
-    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
-      -H "Content-Type: application/json" \
-      "$url")"
-  fi
-
-  if [[ "$status" -ge 400 ]]; then
-    echo "ERROR: $method $url -> HTTP $status" >&2
-    echo "Body:" >&2
-    cat "$tmp_body" >&2
-    rm -f "$tmp_body"
-    return 1
-  fi
-
-  cat "$tmp_body"
-  rm -f "$tmp_body"
-}
-
 json_get() {
   # Extract a field from JSON via python (robust against empty/non-json).
-  # Usage: json_get '<python-expr>' <<<"$json"
-  # Example: json_get 'j.get("access_token","")' <<<"$resp"
+  # Usage: json_get 'j.get("access_token","")' <<<"$json"
   local expr="$1"
   python3 -c "import sys,json
 try:
@@ -88,7 +53,6 @@ get_admin_token() {
       continue
     fi
 
-    # Parse JSON safely (IMPORTANT: python3 -c so stdin remains the JSON)
     local token
     token="$(json_get 'j.get("access_token","")' <<<"$resp")"
 
@@ -106,6 +70,48 @@ get_admin_token() {
 
 ADMIN_TOKEN="$(get_admin_token)"
 AUTH_HEADER=(-H "Authorization: Bearer $ADMIN_TOKEN")
+
+http_json() {
+  # Usage: http_json METHOD URL [JSON_BODY]
+  # Prints body to stdout. Returns non-zero if status >= 400.
+  local method="$1"
+  local url="$2"
+  local body="${3:-}"
+
+  local tmp_body
+  tmp_body="$(mktemp)"
+
+  # Include auth header if present (safe with set -u)
+  local auth_args=()
+  if declare -p AUTH_HEADER >/dev/null 2>&1; then
+    auth_args=("${AUTH_HEADER[@]}")
+  fi
+
+  local status
+  if [[ -n "$body" ]]; then
+    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
+      "${auth_args[@]}" \
+      -H "Content-Type: application/json" \
+      "$url" \
+      -d "$body")"
+  else
+    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
+      "${auth_args[@]}" \
+      -H "Content-Type: application/json" \
+      "$url")"
+  fi
+
+  if [[ "$status" -ge 400 ]]; then
+    echo "ERROR: $method $url -> HTTP $status" >&2
+    echo "Body:" >&2
+    cat "$tmp_body" >&2
+    rm -f "$tmp_body"
+    return 1
+  fi
+
+  cat "$tmp_body"
+  rm -f "$tmp_body"
+}
 
 # ---- 1) Ensure realm exists ----
 set +e
