@@ -22,6 +22,7 @@ BFF_PASS="${BFF_DB_PASSWORD:-openclaw_bff}"
 
 echo "Initializing Postgres (db=$BFF_DB user=$BFF_USER)..."
 
+# 1) Create role if missing (safe in a DO block)
 docker compose -f docker-compose.infra.yml exec -T "$POSTGRES_SVC" psql -U "$SU_USER" -d "$SU_DB" <<SQL
 DO \$\$
 BEGIN
@@ -30,16 +31,18 @@ BEGIN
   END IF;
 END
 \$\$;
-
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${BFF_DB}') THEN
-    CREATE DATABASE ${BFF_DB} OWNER ${BFF_USER};
-  END IF;
-END
-\$\$;
 SQL
 
+# 2) Create database if missing (MUST NOT be inside DO)
+DB_EXISTS="$(docker compose -f docker-compose.infra.yml exec -T "$POSTGRES_SVC" psql -U "$SU_USER" -d "$SU_DB" -tAc "SELECT 1 FROM pg_database WHERE datname='${BFF_DB}'" || true)"
+if [[ "$DB_EXISTS" != "1" ]]; then
+  echo "Creating database: $BFF_DB"
+  docker compose -f docker-compose.infra.yml exec -T "$POSTGRES_SVC" psql -U "$SU_USER" -d "$SU_DB" -c "CREATE DATABASE ${BFF_DB} OWNER ${BFF_USER};"
+else
+  echo "Database exists: $BFF_DB"
+fi
+
+# 3) Enable extension inside target DB
 docker compose -f docker-compose.infra.yml exec -T "$POSTGRES_SVC" psql -U "$SU_USER" -d "$BFF_DB" <<SQL
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 GRANT ALL PRIVILEGES ON DATABASE ${BFF_DB} TO ${BFF_USER};
