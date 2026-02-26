@@ -53,8 +53,22 @@ http_json() {
   rm -f "$tmp_body"
 }
 
+json_get() {
+  # Extract a field from JSON via python (robust against empty/non-json).
+  # Usage: json_get '<python-expr>' <<<"$json"
+  # Example: json_get 'j.get("access_token","")' <<<"$resp"
+  local expr="$1"
+  python3 -c "import sys,json
+try:
+  j=json.load(sys.stdin)
+  v=($expr)
+  print('' if v is None else v)
+except Exception:
+  print('')"
+}
+
 get_admin_token() {
-  # Robust token fetch with retries (Keycloak may be "up" but token endpoint still warming).
+  # Robust token fetch with retries (Keycloak may be 'up' but token endpoint still warming).
   local token_url="$KC_BASE/realms/master/protocol/openid-connect/token"
   local i
   for i in {1..30}; do
@@ -74,17 +88,10 @@ get_admin_token() {
       continue
     fi
 
-    # Parse JSON safely
+    # Parse JSON safely (IMPORTANT: python3 -c so stdin remains the JSON)
     local token
-    token="$(python3 - <<'PY' <<<"$resp"
-import sys, json
-try:
-    j=json.load(sys.stdin)
-    print(j.get("access_token",""))
-except Exception:
-    print("")
-PY
-)"
+    token="$(json_get 'j.get("access_token","")' <<<"$resp")"
+
     if [[ -n "$token" ]]; then
       echo "$token"
       return 0
@@ -101,7 +108,6 @@ ADMIN_TOKEN="$(get_admin_token)"
 AUTH_HEADER=(-H "Authorization: Bearer $ADMIN_TOKEN")
 
 # ---- 1) Ensure realm exists ----
-# Check realm with admin API
 set +e
 realm_status="$(curl -sS -o /dev/null -w "%{http_code}" "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM")"
 set -e
@@ -123,15 +129,12 @@ fi
 
 # ---- 2) Ensure client exists ----
 clients_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/clients?clientId=$CLIENT_ID")"
-client_uuid="$(python3 - <<'PY' <<<"$clients_json"
-import sys, json
+client_uuid="$(python3 -c 'import sys,json
 try:
-    arr=json.load(sys.stdin)
-    print(arr[0]["id"] if arr else "")
+  arr=json.load(sys.stdin)
+  print(arr[0]["id"] if arr else "")
 except Exception:
-    print("")
-PY
-)"
+  print("")' <<<"$clients_json")"
 
 if [[ -z "$client_uuid" ]]; then
   echo "Creating client: $CLIENT_ID"
@@ -156,15 +159,12 @@ fi
 
 # ---- 3) Ensure test user exists ----
 users_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
-user_id="$(python3 - <<'PY' <<<"$users_json"
-import sys, json
+user_id="$(python3 -c 'import sys,json
 try:
-    arr=json.load(sys.stdin)
-    print(arr[0]["id"] if arr else "")
+  arr=json.load(sys.stdin)
+  print(arr[0]["id"] if arr else "")
 except Exception:
-    print("")
-PY
-)"
+  print("")' <<<"$users_json")"
 
 if [[ -z "$user_id" ]]; then
   echo "Creating user: $TEST_USER"
@@ -179,12 +179,12 @@ JSON
 
   # Re-fetch
   users_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
-  user_id="$(python3 - <<'PY' <<<"$users_json"
-import sys, json
-arr=json.load(sys.stdin)
-print(arr[0]["id"] if arr else "")
-PY
-)"
+  user_id="$(python3 -c 'import sys,json
+try:
+  arr=json.load(sys.stdin)
+  print(arr[0]["id"] if arr else "")
+except Exception:
+  print("")' <<<"$users_json")"
 else
   echo "User exists: $TEST_USER"
 fi
