@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Idempotent Keycloak bootstrap via Admin REST API.
-# Creates:
-#  - realm: openclaw-bff (KEYCLOAK_REALM)
-#  - client: openclaw-bff-api (KEYCLOAK_CLIENT_ID)
-#      - public client
-#      - direct access grants enabled (so tests can fetch tokens using password grant)
-#      - standard flow enabled
-#  - test user: testuser / testpassword
-#
-# Keycloak is started in docker-compose with admin bootstrap user.
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -28,18 +17,98 @@ TEST_PASS="${KEYCLOAK_TEST_PASSWORD:-testpassword}"
 echo "Waiting Keycloak..."
 "$ROOT_DIR/scripts/wait_for_http.sh" "$KC_BASE/realms/master" 180
 
-token() {
-  curl -fsS -X POST "$KC_BASE/realms/master/protocol/openid-connect/token"     -H "Content-Type: application/x-www-form-urlencoded"     -d "grant_type=password"     -d "client_id=admin-cli"     -d "username=$KC_ADMIN_USER"     -d "password=$KC_ADMIN_PASS" | python -c "import sys, json; print(json.load(sys.stdin)['access_token'])"
+# ---- helpers ----
+
+http_json() {
+  # Usage: http_json METHOD URL [JSON_BODY]
+  # Prints body to stdout. Returns non-zero if status >= 400.
+  local method="$1"
+  local url="$2"
+  local body="${3:-}"
+
+  local tmp_body
+  tmp_body="$(mktemp)"
+
+  local status
+  if [[ -n "$body" ]]; then
+    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
+      -H "Content-Type: application/json" \
+      "$url" \
+      -d "$body")"
+  else
+    status="$(curl -sS -o "$tmp_body" -w "%{http_code}" -X "$method" \
+      -H "Content-Type: application/json" \
+      "$url")"
+  fi
+
+  if [[ "$status" -ge 400 ]]; then
+    echo "ERROR: $method $url -> HTTP $status" >&2
+    echo "Body:" >&2
+    cat "$tmp_body" >&2
+    rm -f "$tmp_body"
+    return 1
+  fi
+
+  cat "$tmp_body"
+  rm -f "$tmp_body"
 }
 
-ADMIN_TOKEN="$(token)"
-AUTHZ=(-H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json")
+get_admin_token() {
+  # Robust token fetch with retries (Keycloak may be "up" but token endpoint still warming).
+  local token_url="$KC_BASE/realms/master/protocol/openid-connect/token"
+  local i
+  for i in {1..30}; do
+    set +e
+    local resp
+    resp="$(curl -sS -X POST "$token_url" \
+      -H "Content-Type: application/x-www-form-urlencoded" \
+      -d "grant_type=password" \
+      -d "client_id=admin-cli" \
+      -d "username=$KC_ADMIN_USER" \
+      -d "password=$KC_ADMIN_PASS")"
+    local rc=$?
+    set -e
 
-# 1) Ensure realm
-REALM_STATUS="$(curl -s -o /dev/null -w "%{http_code}" "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM" || true)"
-if [[ "$REALM_STATUS" != "200" ]]; then
+    if [[ $rc -ne 0 || -z "$resp" ]]; then
+      sleep 1
+      continue
+    fi
+
+    # Parse JSON safely
+    local token
+    token="$(python3 - <<'PY' <<<"$resp"
+import sys, json
+try:
+    j=json.load(sys.stdin)
+    print(j.get("access_token",""))
+except Exception:
+    print("")
+PY
+)"
+    if [[ -n "$token" ]]; then
+      echo "$token"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "ERROR: Unable to obtain admin token from Keycloak." >&2
+  echo "Check admin credentials and Keycloak logs." >&2
+  return 1
+}
+
+ADMIN_TOKEN="$(get_admin_token)"
+AUTH_HEADER=(-H "Authorization: Bearer $ADMIN_TOKEN")
+
+# ---- 1) Ensure realm exists ----
+# Check realm with admin API
+set +e
+realm_status="$(curl -sS -o /dev/null -w "%{http_code}" "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM")"
+set -e
+
+if [[ "$realm_status" != "200" ]]; then
   echo "Creating realm: $REALM"
-  curl -fsS -X POST "${AUTHZ[@]}" "$KC_BASE/admin/realms" -d @- <<JSON
+  http_json POST "$KC_BASE/admin/realms" "$(cat <<JSON
 {
   "realm": "$REALM",
   "enabled": true,
@@ -47,22 +116,26 @@ if [[ "$REALM_STATUS" != "200" ]]; then
   "sslRequired": "external"
 }
 JSON
+)" >/dev/null
 else
   echo "Realm exists: $REALM"
 fi
 
-# 2) Ensure client
-CLIENTS="$(curl -fsS "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/clients?clientId=$CLIENT_ID")"
-CLIENT_UUID="$(python - <<'PY'
+# ---- 2) Ensure client exists ----
+clients_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/clients?clientId=$CLIENT_ID")"
+client_uuid="$(python3 - <<'PY' <<<"$clients_json"
 import sys, json
-arr=json.load(sys.stdin)
-print(arr[0]["id"] if arr else "")
+try:
+    arr=json.load(sys.stdin)
+    print(arr[0]["id"] if arr else "")
+except Exception:
+    print("")
 PY
-<<<"$CLIENTS")"
+)"
 
-if [[ -z "$CLIENT_UUID" ]]; then
+if [[ -z "$client_uuid" ]]; then
   echo "Creating client: $CLIENT_ID"
-  curl -fsS -X POST "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/clients" -d @- <<JSON
+  http_json POST "$KC_BASE/admin/realms/$REALM/clients" "$(cat <<JSON
 {
   "clientId": "$CLIENT_ID",
   "name": "OpenClaw BFF API",
@@ -76,49 +149,63 @@ if [[ -z "$CLIENT_UUID" ]]; then
   "webOrigins": ["http://localhost:*"]
 }
 JSON
+)" >/dev/null
 else
   echo "Client exists: $CLIENT_ID"
 fi
 
-# 3) Ensure test user
-USERS="$(curl -fsS "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
-USER_ID="$(python - <<'PY'
+# ---- 3) Ensure test user exists ----
+users_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
+user_id="$(python3 - <<'PY' <<<"$users_json"
 import sys, json
-arr=json.load(sys.stdin)
-print(arr[0]["id"] if arr else "")
+try:
+    arr=json.load(sys.stdin)
+    print(arr[0]["id"] if arr else "")
+except Exception:
+    print("")
 PY
-<<<"$USERS")"
+)"
 
-if [[ -z "$USER_ID" ]]; then
+if [[ -z "$user_id" ]]; then
   echo "Creating user: $TEST_USER"
-  curl -fsS -X POST "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/users" -d @- <<JSON
+  http_json POST "$KC_BASE/admin/realms/$REALM/users" "$(cat <<JSON
 {
   "username": "$TEST_USER",
   "enabled": true,
   "emailVerified": true
 }
 JSON
+)" >/dev/null
 
-  # fetch id
-  USERS="$(curl -fsS "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
-  USER_ID="$(python - <<'PY'
+  # Re-fetch
+  users_json="$(curl -sS "${AUTH_HEADER[@]}" "$KC_BASE/admin/realms/$REALM/users?username=$TEST_USER")"
+  user_id="$(python3 - <<'PY' <<<"$users_json"
 import sys, json
 arr=json.load(sys.stdin)
 print(arr[0]["id"] if arr else "")
 PY
-<<<"$USERS")"
+)"
 else
   echo "User exists: $TEST_USER"
 fi
 
+if [[ -z "$user_id" ]]; then
+  echo "ERROR: Could not resolve user id for $TEST_USER" >&2
+  echo "Raw response was:" >&2
+  echo "$users_json" >&2
+  exit 1
+fi
+
+# ---- 4) Set password (idempotent) ----
 echo "Setting password for user: $TEST_USER"
-curl -fsS -X PUT "${AUTHZ[@]}" "$KC_BASE/admin/realms/$REALM/users/$USER_ID/reset-password" -d @- <<JSON
+http_json PUT "$KC_BASE/admin/realms/$REALM/users/$user_id/reset-password" "$(cat <<JSON
 {
   "type": "password",
   "value": "$TEST_PASS",
   "temporary": false
 }
 JSON
+)" >/dev/null
 
 echo "Keycloak initialized."
 echo "Realm: $REALM"
