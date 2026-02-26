@@ -23,7 +23,7 @@ BFF_SECRET="${MINIO_BFF_SECRET_KEY:-openclaw-bff-secret}"
 
 echo "Initializing MinIO (bucket=$BUCKET user=$BFF_ACCESS)..."
 
-docker run --rm --network "$NET" minio/mc:latest /bin/sh -lc "
+docker run --rm --network "$NET" --entrypoint /bin/sh minio/mc:latest -c "
   set -e;
   mc alias set local $MINIO_ENDPOINT $ROOT_USER $ROOT_PASS >/dev/null;
 
