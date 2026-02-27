@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runs the backend on the HOST (not in Docker), using .env in repo root.
-# Requires Python + venv.
+# =============================================================================
+# dev_run.sh
+# =============================================================================
+# Avvia il backend FastAPI (BFF) sul tuo HOST (non dentro Docker),
+# leggendo la configurazione dal file .env nella root del repo.
+#
+# Prerequisiti:
+# - python + venv attivo
+# - dipendenze installate: pip install -r requirements.txt
+# - infra avviata: ./scripts/init_all.sh
+#
+# Nota:
+# - KEYCLOAK_ENABLED=true richiede Authorization: Bearer <JWT Keycloak> per chiamare API.
+# - KEYCLOAK_ENABLED=false abilita header X-Debug-User per test rapidi.
+# =============================================================================
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
@@ -12,10 +25,11 @@ if [[ ! -f ".env" ]]; then
   exit 1
 fi
 
-export $(grep -v '^#' .env | xargs) || true
+# Carica variabili da .env in modo robusto.
+# set -a esporta automaticamente tutte le variabili definite in .env
+set -a
+source .env
+set +a
 
-# If you are using a venv:
-#   python -m venv .venv
-#   source .venv/bin/activate
-#   pip install -r requirements.txt
+# Avvio backend (no reload per evitare problemi con cartelle infra/* e permessi Docker)
 uvicorn app.main:app --host 0.0.0.0 --port "${BFF_PORT:-8000}"
