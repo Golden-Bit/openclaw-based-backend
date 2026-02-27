@@ -11,23 +11,18 @@ Handshake (schema strict, basato su quello che la tua build richiede):
 2) client -> req: connect { minProtocol/maxProtocol/client/role/scopes/... + device(signature) }
 3) server -> res: hello-ok payload
 
-PROBLEMA risolto qui:
-- "device signature invalid" / problemi identity:
-  ora riusiamo la device identity del CLI via OPENCLAW_IDENTITY_FILE.
-  Nel tuo caso il file contiene *PEM*:
-    - publicKeyPem
-    - privateKeyPem
-  Quindi parsifichiamo PEM con cryptography e ricaviamo raw key (32 bytes).
+Identity/device:
+- Il tuo OPENCLAW CLI salva identity in ~/.openclaw/identity/device.json con PEM:
+    publicKeyPem / privateKeyPem / deviceId
+- Questo client RIUSA quella identity (OPENCLAW_IDENTITY_FILE) e firma la challenge.
+  Questo è necessario per evitare "device signature invalid".
 
-ENV supportate (importanti):
-- OPENCLAW_WS_URL
-- OPENCLAW_BEARER_TOKEN (o OPENCLAW_GATEWAY_TOKEN)
-- OPENCLAW_CLIENT_ID
-- OPENCLAW_CLIENT_MODE
-- OPENCLAW_ROLE
-- OPENCLAW_SCOPES (comma-separated)
-- OPENCLAW_IDENTITY_FILE (prioritaria; es: ~/.openclaw/identity/device.json)
-- OPENCLAW_STATE_DIR (fallback: identity generata dal BFF, sconsigliata nel tuo setup)
+WS debug (NUOVO):
+- OPENCLAW_WS_DEBUG=1 abilita log di:
+  - ogni evento WS: eventName + stream + runId + keys(payload)
+  - ogni res errore
+- subscribe_all(): permette di ricevere TUTTI gli eventi WS (qualunque event name),
+  così puoi capire se i tool events arrivano su event diverso da "agent".
 
 Nota websockets:
 - websockets >= 15/16 usa additional_headers (NON extra_headers).
@@ -93,11 +88,6 @@ def _b64url_decode(s: str) -> bytes:
 
 
 def _b64_any_decode(s: str) -> bytes:
-    """
-    Decodifica una chiave in base64 / base64url.
-    - Se contiene '-' '_' assume base64url.
-    - Altrimenti prova base64 standard.
-    """
     s = (s or "").strip().strip('"').strip("'")
     if not s:
         return b""
@@ -122,13 +112,17 @@ def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     return v if (v is not None and v != "") else default
 
 
+def _ws_debug_enabled() -> bool:
+    return (_env("OPENCLAW_WS_DEBUG", "0") or "0").lower() in ("1", "true", "yes", "on")
+
+
+def _dbg(*args: Any) -> None:
+    if _ws_debug_enabled():
+        # stampa semplice su stdout; uvicorn lo mostra in console
+        print("[openclaw_ws DEBUG]", *args)
+
+
 def _get_gateway_token() -> str:
-    """
-    Token del gateway:
-    - preferisci OPENCLAW_BEARER_TOKEN (come nel tuo .env)
-    - fallback OPENCLAW_GATEWAY_TOKEN
-    - fallback settings.openclaw_bearer_token (se mappato dal Settings)
-    """
     return (
         _env("OPENCLAW_BEARER_TOKEN")
         or _env("OPENCLAW_GATEWAY_TOKEN")
@@ -167,15 +161,10 @@ def _platform_string() -> str:
 
 
 # =============================================================================
-# Device identity loading
+# Device identity loading (CLI PEM)
 # =============================================================================
 
 def _state_dir() -> Path:
-    """
-    Directory per state locale del BFF.
-    Se OPENCLAW_STATE_DIR è impostata, usala (come nel tuo .env: ~/.openclaw-bff).
-    Altrimenti fallback ~/.openclaw-bff.
-    """
     base = _env("OPENCLAW_STATE_DIR") or _env("OPENCLAW_BFF_STATE_DIR")
     if base:
         return Path(base).expanduser().resolve()
@@ -195,22 +184,12 @@ def _read_json(path: Path) -> Optional[dict]:
 
 
 def _load_identity_from_cli_file(path: Path) -> Optional[dict]:
-    """
-    Carica identity dal file del CLI (OPENCLAW_IDENTITY_FILE).
-    Nel tuo caso contiene:
-      - deviceId
-      - publicKeyPem
-      - privateKeyPem
-    """
     if not path.exists():
         return None
     return _read_json(path)
 
 
 def _pem_to_ed25519_private_raw(pem_str: str) -> bytes:
-    """
-    Carica una private key PEM (PKCS8 / “BEGIN PRIVATE KEY”) e ritorna raw 32 bytes.
-    """
     pem = pem_str.replace("\\n", "\n").strip().encode("utf-8")
     key = load_pem_private_key(pem, password=None)
     if not isinstance(key, Ed25519PrivateKey):
@@ -222,9 +201,6 @@ def _pem_to_ed25519_private_raw(pem_str: str) -> bytes:
 
 
 def _pem_to_ed25519_public_raw(pem_str: str) -> bytes:
-    """
-    Carica una public key PEM (SubjectPublicKeyInfo / “BEGIN PUBLIC KEY”) e ritorna raw 32 bytes.
-    """
     pem = pem_str.replace("\\n", "\n").strip().encode("utf-8")
     key = load_pem_public_key(pem)
     if not isinstance(key, Ed25519PublicKey):
@@ -237,8 +213,7 @@ def _pem_to_ed25519_public_raw(pem_str: str) -> bytes:
 
 def _generate_identity(sd: Path) -> dict:
     """
-    Fallback: genera una identity Ed25519 locale del BFF.
-    (Nel tuo setup probabilmente NON verrà accettata dal gateway se richiede identity del CLI.)
+    Fallback identity locale (sconsigliata nel tuo setup, ma tenuta come fallback).
     """
     sd.mkdir(parents=True, exist_ok=True)
     p = _identity_path(sd)
@@ -267,13 +242,12 @@ def _generate_identity(sd: Path) -> dict:
 def _normalize_identity(raw: dict) -> tuple[str, bytes, bytes]:
     """
     Normalizza identity a:
-      (device_id_str, pub_raw_bytes(32), priv_raw_bytes(32))
+      (device_id_str, pub_raw(32), priv_raw(32))
 
     Supporta:
-    - PEM: publicKeyPem / privateKeyPem (TUO CASO)
-    - base64/base64url: publicKey / privateKeyB64 / secretKey / ...
+    - PEM: publicKeyPem/privateKeyPem (tuo caso)
+    - base64: publicKey/privateKeyB64...
     """
-    # 1) device id (preferisci deviceId dal CLI)
     dev_id = (
         raw.get("deviceId")
         or raw.get("id")
@@ -283,15 +257,14 @@ def _normalize_identity(raw: dict) -> tuple[str, bytes, bytes]:
     )
     dev_id = str(dev_id)
 
-    # 2) PEM path (preferito)
     pub_raw = b""
     priv_raw = b""
+
     if isinstance(raw.get("privateKeyPem"), str) and raw["privateKeyPem"].strip():
         priv_raw = _pem_to_ed25519_private_raw(raw["privateKeyPem"])
     if isinstance(raw.get("publicKeyPem"), str) and raw["publicKeyPem"].strip():
         pub_raw = _pem_to_ed25519_public_raw(raw["publicKeyPem"])
 
-    # 3) fallback base64/base64url
     if not priv_raw:
         priv_s = (
             raw.get("privateKeyB64")
@@ -315,22 +288,17 @@ def _normalize_identity(raw: dict) -> tuple[str, bytes, bytes]:
         if pub_s:
             pub_raw = _b64_any_decode(str(pub_s))
 
-    # Normalizza priv 64->32
     if len(priv_raw) == 64:
         priv_raw = priv_raw[:32]
-
     if len(priv_raw) != 32:
         raise RuntimeError(f"Invalid Ed25519 private key length: {len(priv_raw)} (expected 32)")
 
-    # Deriva pub se mancante
     priv = Ed25519PrivateKey.from_private_bytes(priv_raw)
     if not pub_raw:
         pub_raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-
     if len(pub_raw) != 32:
         raise RuntimeError(f"Invalid Ed25519 public key length: {len(pub_raw)} (expected 32)")
 
-    # Deriva id se mancante
     if not dev_id:
         dev_id = hashlib.sha256(pub_raw).hexdigest()
 
@@ -353,7 +321,8 @@ class OpenClawWSClient:
         self._lock = asyncio.Lock()
 
         # subscriptions
-        self._subs: List[Tuple[str, Optional[str], asyncio.Queue]] = []
+        # (event_name, run_id_filter, queue)
+        self._subs: List[Tuple[Optional[str], Optional[str], asyncio.Queue]] = []
 
         # timeouts
         self._connect_timeout = float(_env("OPENCLAW_WS_CONNECT_TIMEOUT", "10") or "10")
@@ -373,11 +342,6 @@ class OpenClawWSClient:
     # -------------------------------------------------------------------------
 
     def _load_identity(self) -> None:
-        """
-        Carica identity da:
-        1) OPENCLAW_IDENTITY_FILE (CLI) se esiste
-        2) fallback: genera identity locale in OPENCLAW_STATE_DIR
-        """
         if self._device_id and self._pub_raw and self._priv_raw:
             return
 
@@ -386,15 +350,18 @@ class OpenClawWSClient:
         if self._identity_file:
             p = Path(self._identity_file).expanduser().resolve()
             raw_ident = _load_identity_from_cli_file(p)
+            _dbg("identity file:", str(p), "loaded:", bool(raw_ident))
 
         if raw_ident is None:
             raw_ident = _generate_identity(self._state_dir)
+            _dbg("identity fallback generated in:", str(self._state_dir))
 
         dev_id, pub_raw, priv_raw = _normalize_identity(raw_ident)
-
         self._device_id = dev_id
         self._pub_raw = pub_raw
         self._priv_raw = priv_raw
+
+        _dbg("identity normalized:", {"deviceId": self._device_id, "pubLen": len(pub_raw), "privLen": len(priv_raw)})
 
     def _build_device_signature(
         self,
@@ -408,30 +375,15 @@ class OpenClawWSClient:
         scopes: List[str],
     ) -> dict:
         """
-        Firma "v2" (compat) usata nel tuo setup.
-
-        Payload deterministico:
+        Firma v2:
           v2|deviceId|clientId|clientMode|role|scopes_csv|ts|token|nonce
-
-        Signature: Ed25519(payload), base64url senza padding.
         """
         self._load_identity()
         assert self._device_id and self._pub_raw and self._priv_raw
 
         scopes_csv = ",".join(scopes)
-
         payload = "|".join(
-            [
-                "v2",
-                self._device_id,
-                client_id,
-                client_mode,
-                role,
-                scopes_csv,
-                str(ts_ms),
-                token or "",
-                nonce,
-            ]
+            ["v2", self._device_id, client_id, client_mode, role, scopes_csv, str(ts_ms), token or "", nonce]
         ).encode("utf-8")
 
         priv = Ed25519PrivateKey.from_private_bytes(self._priv_raw)
@@ -450,21 +402,14 @@ class OpenClawWSClient:
     # -------------------------------------------------------------------------
 
     async def connect(self) -> WSHello:
-        """
-        Connette e completa handshake.
-        - Non ritorna mai None: o WSHello o solleva eccezione.
-        """
         async with self._lock:
             if self._ws is not None and self.hello is not None:
                 return self.hello
 
-            # cleanup half-open
             if self._ws is not None and self.hello is None:
                 await self.close()
 
             token = _get_gateway_token()
-
-            # Authorization header in WS handshake
             additional_headers: Optional[List[Tuple[str, str]]] = None
             if token:
                 additional_headers = [("Authorization", f"Bearer {token}")]
@@ -480,14 +425,12 @@ class OpenClawWSClient:
                     close_timeout=10,
                 )
 
-                # 1) receive challenge (strict)
                 challenge = await self._recv_challenge()
                 nonce = str(challenge.get("nonce") or "")
                 ts = int(challenge.get("ts") or _now_ms())
                 if not nonce:
                     raise RuntimeError("connect.challenge missing nonce")
 
-                # 2) build connect params from ENV (must match gateway schema)
                 client_id = _get_client_id()
                 client_mode = _get_client_mode()
                 role = _get_role()
@@ -506,12 +449,7 @@ class OpenClawWSClient:
                 connect_params: Dict[str, Any] = {
                     "minProtocol": 3,
                     "maxProtocol": 3,
-                    "client": {
-                        "id": client_id,
-                        "mode": client_mode,
-                        "platform": _platform_string(),
-                        "version": "0.1.0",
-                    },
+                    "client": {"id": client_id, "mode": client_mode, "platform": _platform_string(), "version": "0.1.0"},
                     "role": role,
                     "scopes": scopes,
                     "caps": [],
@@ -524,7 +462,6 @@ class OpenClawWSClient:
                 }
 
                 hello_payload = await self._rpc_handshake("connect", connect_params, timeout=self._connect_timeout)
-
                 if not isinstance(hello_payload, dict):
                     raise RuntimeError(f"Unexpected hello payload type: {type(hello_payload)}")
 
@@ -535,12 +472,13 @@ class OpenClawWSClient:
                     raw=hello_payload,
                 )
 
-                # Start listener AFTER handshake
                 self._listener_task = asyncio.create_task(self._listener())
+                _dbg("WS connected. hello.protocol=", self.hello.protocol)
 
                 return self.hello
 
-            except Exception:
+            except Exception as e:
+                _dbg("WS connect failed:", repr(e))
                 await self.close()
                 raise
 
@@ -558,9 +496,6 @@ class OpenClawWSClient:
         return payload
 
     async def _rpc_handshake(self, method: str, params: dict, timeout: float) -> Any:
-        """
-        RPC minimale SOLO per handshake (prima del listener).
-        """
         assert self._ws is not None
         req_id = uuid.uuid4().hex
         await self._ws.send(json.dumps({"type": "req", "id": req_id, "method": method, "params": params}))
@@ -572,6 +507,7 @@ class OpenClawWSClient:
             raise RuntimeError(f"Unexpected handshake response frame: {data}")
 
         if data.get("ok") is not True:
+            _dbg("handshake res error:", data.get("error"))
             raise RuntimeError(str(data.get("error") or {}))
 
         return data.get("payload")
@@ -581,9 +517,6 @@ class OpenClawWSClient:
     # -------------------------------------------------------------------------
 
     async def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> Any:
-        """
-        RPC high-level: garantisce connessione + hello poi invia la request.
-        """
         if self._ws is None or self.hello is None:
             await self.connect()
 
@@ -605,9 +538,7 @@ class OpenClawWSClient:
 
     async def subscribe(self, event_name: str, run_id: Optional[str] = None) -> AsyncGenerator[WSEvent, None]:
         """
-        Sottoscrive eventi gateway:
-        - event_name: es. "agent", "chat", ecc.
-        - run_id: se fornito, filtra payload.runId == run_id
+        Sottoscrive SOLO un event name (es: "agent") con filtro runId opzionale.
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._subs.append((event_name, run_id, q))
@@ -618,12 +549,20 @@ class OpenClawWSClient:
         finally:
             self._subs = [s for s in self._subs if s[2] is not q]
 
+    async def subscribe_all(self, run_id: Optional[str] = None) -> AsyncGenerator[WSEvent, None]:
+        """
+        Sottoscrive TUTTI gli event name (debug). Utile per capire dove arrivano i tool events.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        self._subs.append((None, run_id, q))
+        try:
+            while True:
+                item = await q.get()
+                yield item
+        finally:
+            self._subs = [s for s in self._subs if s[2] is not q]
+
     async def _listener(self) -> None:
-        """
-        Listener principale:
-        - risolve futures per i res
-        - inoltra eventi ai subscriber
-        """
         assert self._ws is not None
         try:
             async for msg in self._ws:
@@ -637,32 +576,41 @@ class OpenClawWSClient:
                         if data.get("ok") is True:
                             fut.set_result(data.get("payload"))
                         else:
-                            fut.set_exception(RuntimeError(str(data.get("error") or "WS RPC error")))
+                            err = data.get("error")
+                            _dbg("RPC error res:", {"id": req_id, "error": err})
+                            fut.set_exception(RuntimeError(str(err or "WS RPC error")))
 
                 elif t == "event":
                     ev = str(data.get("event") or "")
-                    payload = data.get("payload") if isinstance(data.get("payload"), dict) else (data.get("payload") or {})
-                    if not isinstance(payload, dict):
-                        payload = {"raw": payload}
+                    payload_any = data.get("payload")
+                    payload = payload_any if isinstance(payload_any, dict) else {"raw": payload_any}
 
                     run_id = str(payload.get("runId") or payload.get("run_id") or "")
+                    stream = payload.get("stream") if isinstance(payload, dict) else None
 
-                    ws_event = WSEvent(event=ev, payload=payload)
+                    if _ws_debug_enabled():
+                        keys = list(payload.keys()) if isinstance(payload, dict) else []
+                        _dbg("EVENT:", {"event": ev, "stream": stream, "runId": run_id, "keys": keys})
 
+                    ws_event = WSEvent(event=ev, payload=payload if isinstance(payload, dict) else {"raw": payload})
+
+                    # broadcast
                     for wanted_ev, wanted_run, q in list(self._subs):
-                        if wanted_ev != ev:
+                        if wanted_ev is not None and wanted_ev != ev:
                             continue
                         if wanted_run and wanted_run != run_id:
                             continue
                         try:
                             q.put_nowait(ws_event)
                         except asyncio.QueueFull:
+                            # consumer lento: droppa
                             pass
 
                 else:
                     pass
 
-        except Exception:
+        except Exception as e:
+            _dbg("listener stopped:", repr(e))
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError("WebSocket closed"))
@@ -673,7 +621,6 @@ class OpenClawWSClient:
     # -------------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Chiude WS e resetta lo stato interno (idempotente)."""
         if self._listener_task:
             self._listener_task.cancel()
 
