@@ -7,9 +7,9 @@ OpenClaw usa frame JSON con tipi:
 - event: eventi server->client (es: connect.challenge, chat stream, ecc.)
 
 Handshake tipico (semplificato):
-1) server -> event: connect.challenge (opzionale, dipende dalla build/config)
-2) client -> req: connect { ... }  (DEVE arrivare presto dopo l'apertura WS)
-3) server -> res: hello-ok payload (policy + features.methods/events + snapshot)
+1) (opzionale) server -> event: connect.challenge
+2) client -> req: connect { ... }
+3) server -> res: payload hello-ok (protocol/policy/features)
 
 ⚠️ Nota "device identity":
 Alcune installazioni richiedono una device identity firmata (Ed25519) in `connect_params.device`.
@@ -19,19 +19,16 @@ Questo client supporta device signing se sono presenti env vars:
 - OPENCLAW_WS_PUBLIC_KEY_B64 (opzionale; se assente viene derivata dalla private)
 
 Auth token:
-- Questo client supporta token Bearer in due modi:
-  A) Header HTTP del WebSocket handshake: Authorization: Bearer <token>
-  B) Campo connect_params.auth.token (alcune build lo usano)
+- supportato in due modi:
+  A) Header del WS handshake: Authorization: Bearer <token>
+  B) Campo connect_params.auth.token
 
 Compatibilità websockets:
-- Con websockets >= 15/16 l'argomento per gli header si chiama `additional_headers`
-  (NON `extra_headers`).
-  Signature (16.0): websockets.connect(..., additional_headers=..., ...)
+- websockets >= 15/16 usa `additional_headers` (NON `extra_headers`)
 
-Bug fixes rispetto alla versione base:
-- connect() non ritorna mai None: o WSHello o eccezione
-- se la prima handshake fallisce, pulisce _ws e hello (evita stato half-open)
-- non aspetta 5s per la challenge prima di inviare connect: best-effort (0.5s)
+Fix critico:
+- NESSUN DEADLOCK: connect() non chiama call().
+  In precedenza: connect() -> call("connect") -> call() richiamava connect() perché hello==None.
 """
 
 from __future__ import annotations
@@ -85,8 +82,11 @@ class OpenClawWSClient:
         self._priv: Optional[Ed25519PrivateKey] = None
         self._pub_b64: Optional[str] = None
 
-        import os
+        # Timeouts (evitano "attese infinite")
+        self._connect_timeout = 10.0
+        self._rpc_timeout = 20.0
 
+        import os
         dev_id = os.getenv("OPENCLAW_WS_DEVICE_ID")
         priv_b64 = os.getenv("OPENCLAW_WS_PRIVATE_KEY_B64")
         pub_b64 = os.getenv("OPENCLAW_WS_PUBLIC_KEY_B64")
@@ -125,29 +125,30 @@ class OpenClawWSClient:
             if self._ws is not None and self.hello is None:
                 await self.close()
 
-            # Prepare auth header (best compatibility)
+            # Prepare auth header (websockets 16 uses additional_headers)
             additional_headers: Optional[List[Tuple[str, str]]] = None
             if settings.openclaw_bearer_token:
                 additional_headers = [("Authorization", f"Bearer {settings.openclaw_bearer_token}")]
 
             try:
-                # IMPORTANT: websockets 16.x uses `additional_headers` (not extra_headers)
+                # 1) Open WS
                 self._ws = await websockets.connect(
                     self.url,
                     max_size=10 * 1024 * 1024,
                     additional_headers=additional_headers,
                     ping_interval=20,
                     ping_timeout=20,
-                    open_timeout=10,
+                    open_timeout=self._connect_timeout,
                     close_timeout=10,
                 )
 
-                # Start listener ASAP (so we can receive events/responses)
+                # 2) Start listener ASAP
                 self._listener_task = asyncio.create_task(self._listener())
 
-                # Best-effort challenge wait (short). Some builds won't send it at all.
+                # 3) Best-effort wait for challenge (short)
                 challenge = await self._wait_for_challenge(timeout=0.5)
 
+                # 4) Build connect params
                 connect_params: Dict[str, Any] = {
                     "minProtocol": 1,
                     "maxProtocol": 3,
@@ -163,16 +164,13 @@ class OpenClawWSClient:
                     "auth": {},
                 }
 
-                # Token also inside connect payload (some builds use it here)
                 if settings.openclaw_bearer_token:
                     connect_params["auth"]["token"] = settings.openclaw_bearer_token
 
-                # Optional device signature (only if we have keys and a challenge/nonce)
+                # Optional device signature
                 if challenge and self._priv and self.device_id and self._pub_b64:
                     nonce = str(challenge.get("nonce") or "")
                     signed_at = int(time.time() * 1000)
-
-                    # NOTE: payload format can vary by build; this is a common deterministic format.
                     payload = f"v1|{self.device_id}|{signed_at}|{nonce}".encode("utf-8")
                     sig = self._priv.sign(payload)
                     sig_b64 = base64.b64encode(sig).decode("ascii")
@@ -185,8 +183,8 @@ class OpenClawWSClient:
                         "nonce": nonce,
                     }
 
-                # Perform connect RPC
-                hello_payload = await self.call("connect", connect_params)
+                # 5) IMPORTANT: send connect as raw req (NO call(), otherwise deadlock)
+                hello_payload = await self._rpc_raw("connect", connect_params, timeout=self._connect_timeout)
 
                 if not isinstance(hello_payload, dict):
                     raise RuntimeError(f"Unexpected hello payload type: {type(hello_payload)}")
@@ -203,6 +201,42 @@ class OpenClawWSClient:
                 # If anything fails, reset state so the next connect() is clean.
                 await self.close()
                 raise
+
+    async def _rpc_raw(self, method: str, params: dict | None, timeout: float) -> Any:
+        """
+        RPC low-level: invia un req e aspetta il res corrispondente.
+
+        Non richiama connect() e non richiede hello già presente.
+        Serve proprio per implementare l'handshake connect senza deadlock.
+        """
+        if self._ws is None:
+            raise RuntimeError("WS is not open")
+
+        req_id = uuid.uuid4().hex
+        frame = {"type": "req", "id": req_id, "method": method, "params": params or {}}
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending[req_id] = fut
+
+        await self._ws.send(json.dumps(frame))
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+    async def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> Any:
+        """
+        RPC high-level: garantisce connessione + hello poi invia la request.
+
+        Nota: non usare per method='connect'. L'handshake lo gestisce connect().
+        """
+        if method == "connect":
+            raise RuntimeError("Do not call method 'connect' via call(); use connect().")
+
+        if self._ws is None or self.hello is None:
+            await self.connect()
+
+        assert self._ws is not None
+
+        return await self._rpc_raw(method, params, timeout=timeout or self._rpc_timeout)
 
     async def _wait_for_challenge(self, timeout: float = 0.5) -> Optional[dict]:
         """Attende un event connect.challenge per un tempo breve (best-effort)."""
@@ -234,43 +268,19 @@ class OpenClawWSClient:
                             fut.set_exception(RuntimeError(data.get("error") or "WS RPC error"))
 
                 elif t == "event":
-                    # challenge used during handshake
                     if data.get("event") == "connect.challenge":
                         self._last_challenge = data.get("payload")
 
                 else:
-                    # ignore unknown frame
+                    # ignore unknown
                     pass
 
         except Exception:
-            # If WS closes unexpectedly: fail all pending futures
+            # Fail pending futures if WS closes unexpectedly
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError("WebSocket closed"))
             self._pending.clear()
-
-    async def call(self, method: str, params: dict | None = None, timeout: float = 20.0) -> Any:
-        """
-        Esegue una chiamata RPC e ritorna payload.
-
-        NOTE:
-        - call() assicura che connect() sia stato completato (hello non-None).
-        - se il WS cade, solleva eccezione.
-        """
-        if self._ws is None or self.hello is None:
-            await self.connect()
-
-        assert self._ws is not None
-
-        req_id = uuid.uuid4().hex
-        frame = {"type": "req", "id": req_id, "method": method, "params": params or {}}
-
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._pending[req_id] = fut
-
-        await self._ws.send(json.dumps(frame))
-        return await asyncio.wait_for(fut, timeout=timeout)
 
     async def close(self) -> None:
         """Chiude WS e resetta lo stato interno (idempotente)."""
@@ -285,5 +295,11 @@ class OpenClawWSClient:
 
         self._ws = None
         self.hello = None
+
+        # Fail any pending futures explicitly (avoid hanging awaits)
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(RuntimeError("WS client closed"))
         self._pending.clear()
+
         self._last_challenge = None
