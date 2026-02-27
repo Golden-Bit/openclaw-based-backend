@@ -2,30 +2,32 @@
 Client WebSocket (RPC) verso OpenClaw Gateway.
 
 Frame JSON:
-- req:  {"type":"req","id": "...", "method":"...", "params":{...}}
-- res:  {"type":"res","id": "...", "ok":true, "payload":{...}} oppure ok:false,error
-- event:{"type":"event","event":"...", "payload":{...}}
+- req:   {"type":"req","id":"...", "method":"...", "params":{...}}
+- res:   {"type":"res","id":"...", "ok":true, "payload":{...}} oppure ok:false,error
+- event: {"type":"event","event":"...", "payload":{...}}
 
 Handshake (schema strict, basato su quello che la tua build richiede):
 1) server -> event: connect.challenge { nonce, ts? }
 2) client -> req: connect { minProtocol/maxProtocol/client/role/scopes/... + device(signature) }
 3) server -> res: hello-ok payload
 
-PROBLEMA che stai risolvendo:
-- "device signature invalid" succede quando generi una identity nuova non riconosciuta dal gateway
-  o quando la firma non usa la stessa chiave/device identity del CLI.
-- SOLUZIONE: riusare la device identity del CLI via OPENCLAW_IDENTITY_FILE
-  (es: ~/.openclaw/identity/device.json)
+PROBLEMA risolto qui:
+- "device signature invalid" / problemi identity:
+  ora riusiamo la device identity del CLI via OPENCLAW_IDENTITY_FILE.
+  Nel tuo caso il file contiene *PEM*:
+    - publicKeyPem
+    - privateKeyPem
+  Quindi parsifichiamo PEM con cryptography e ricaviamo raw key (32 bytes).
 
 ENV supportate (importanti):
 - OPENCLAW_WS_URL
-- OPENCLAW_BEARER_TOKEN  (o OPENCLAW_GATEWAY_TOKEN)
+- OPENCLAW_BEARER_TOKEN (o OPENCLAW_GATEWAY_TOKEN)
 - OPENCLAW_CLIENT_ID
 - OPENCLAW_CLIENT_MODE
 - OPENCLAW_ROLE
 - OPENCLAW_SCOPES (comma-separated)
-- OPENCLAW_IDENTITY_FILE  (prioritaria)
-- OPENCLAW_STATE_DIR      (fallback state per identity generata dal BFF)
+- OPENCLAW_IDENTITY_FILE (prioritaria; es: ~/.openclaw/identity/device.json)
+- OPENCLAW_STATE_DIR (fallback: identity generata dal BFF, sconsigliata nel tuo setup)
 
 Nota websockets:
 - websockets >= 15/16 usa additional_headers (NON extra_headers).
@@ -45,8 +47,15 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import websockets
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+    PublicFormat,
+    load_pem_private_key,
+    load_pem_public_key,
+)
 
 from app.core.config import settings
 
@@ -89,18 +98,19 @@ def _b64_any_decode(s: str) -> bytes:
     - Se contiene '-' '_' assume base64url.
     - Altrimenti prova base64 standard.
     """
-    s = s.strip().strip('"').strip("'")
+    s = (s or "").strip().strip('"').strip("'")
     if not s:
         return b""
     try:
         if "-" in s or "_" in s:
             return _b64url_decode(s)
-        # base64 standard
         pad = "=" * ((4 - (len(s) % 4)) % 4)
         return base64.b64decode((s + pad).encode("utf-8"))
     except Exception:
-        # ultimo tentativo: urlsafe
-        return _b64url_decode(s)
+        try:
+            return _b64url_decode(s)
+        except Exception:
+            return b""
 
 
 def _now_ms() -> int:
@@ -176,20 +186,53 @@ def _identity_path(sd: Path) -> Path:
     return sd / "device_identity.json"
 
 
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        j = json.loads(path.read_text(encoding="utf-8"))
+        return j if isinstance(j, dict) else None
+    except Exception:
+        return None
+
+
 def _load_identity_from_cli_file(path: Path) -> Optional[dict]:
     """
     Carica identity dal file del CLI (OPENCLAW_IDENTITY_FILE).
-    Il formato può variare tra versioni: supportiamo diversi campi possibili.
+    Nel tuo caso contiene:
+      - deviceId
+      - publicKeyPem
+      - privateKeyPem
     """
     if not path.exists():
         return None
-    try:
-        j = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(j, dict):
-            return j
-    except Exception:
-        return None
-    return None
+    return _read_json(path)
+
+
+def _pem_to_ed25519_private_raw(pem_str: str) -> bytes:
+    """
+    Carica una private key PEM (PKCS8 / “BEGIN PRIVATE KEY”) e ritorna raw 32 bytes.
+    """
+    pem = pem_str.replace("\\n", "\n").strip().encode("utf-8")
+    key = load_pem_private_key(pem, password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise RuntimeError(f"Identity privateKeyPem is not Ed25519 (got {type(key)})")
+    raw = key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    if len(raw) != 32:
+        raise RuntimeError(f"Invalid Ed25519 raw private length from PEM: {len(raw)} (expected 32)")
+    return raw
+
+
+def _pem_to_ed25519_public_raw(pem_str: str) -> bytes:
+    """
+    Carica una public key PEM (SubjectPublicKeyInfo / “BEGIN PUBLIC KEY”) e ritorna raw 32 bytes.
+    """
+    pem = pem_str.replace("\\n", "\n").strip().encode("utf-8")
+    key = load_pem_public_key(pem)
+    if not isinstance(key, Ed25519PublicKey):
+        raise RuntimeError(f"Identity publicKeyPem is not Ed25519 (got {type(key)})")
+    raw = key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    if len(raw) != 32:
+        raise RuntimeError(f"Invalid Ed25519 raw public length from PEM: {len(raw)} (expected 32)")
+    return raw
 
 
 def _generate_identity(sd: Path) -> dict:
@@ -200,27 +243,22 @@ def _generate_identity(sd: Path) -> dict:
     sd.mkdir(parents=True, exist_ok=True)
     p = _identity_path(sd)
     if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
+        j = _read_json(p)
+        if j:
+            return j
 
     priv = Ed25519PrivateKey.generate()
     pub = priv.public_key()
 
-    pub_raw = pub.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw,
-    )
-    priv_raw = priv.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
+    pub_raw = pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+    priv_raw = priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
 
     dev_id = hashlib.sha256(pub_raw).hexdigest()
 
     ident = {
         "id": dev_id,
-        "publicKey": _b64url_encode(pub_raw),     # base64url no padding
-        "privateKeyB64": _b64url_encode(priv_raw) # base64url no padding
+        "publicKey": _b64url_encode(pub_raw),
+        "privateKeyB64": _b64url_encode(priv_raw),
     }
     p.write_text(json.dumps(ident, indent=2), encoding="utf-8")
     return ident
@@ -229,61 +267,71 @@ def _generate_identity(sd: Path) -> dict:
 def _normalize_identity(raw: dict) -> tuple[str, bytes, bytes]:
     """
     Normalizza identity a:
-      (device_id_hex, pub_raw_bytes, priv_raw_32_bytes)
+      (device_id_str, pub_raw_bytes(32), priv_raw_bytes(32))
 
-    Accetta varianti di campi tipiche:
-    - id / deviceId
-    - publicKey / publicKeyB64 / publicKeyBase64
-    - privateKeyB64 / privateKey / secretKey / ed25519PrivateKey
+    Supporta:
+    - PEM: publicKeyPem / privateKeyPem (TUO CASO)
+    - base64/base64url: publicKey / privateKeyB64 / secretKey / ...
     """
-    # id
+    # 1) device id (preferisci deviceId dal CLI)
     dev_id = (
-        raw.get("id")
-        or raw.get("deviceId")
+        raw.get("deviceId")
+        or raw.get("id")
         or raw.get("device_id")
         or raw.get("deviceID")
         or ""
     )
     dev_id = str(dev_id)
 
-    # public key
-    pub_s = (
-        raw.get("publicKey")
-        or raw.get("publicKeyB64")
-        or raw.get("publicKeyBase64")
-        or raw.get("public_key")
-        or ""
-    )
-    pub_raw = _b64_any_decode(str(pub_s)) if pub_s else b""
+    # 2) PEM path (preferito)
+    pub_raw = b""
+    priv_raw = b""
+    if isinstance(raw.get("privateKeyPem"), str) and raw["privateKeyPem"].strip():
+        priv_raw = _pem_to_ed25519_private_raw(raw["privateKeyPem"])
+    if isinstance(raw.get("publicKeyPem"), str) and raw["publicKeyPem"].strip():
+        pub_raw = _pem_to_ed25519_public_raw(raw["publicKeyPem"])
 
-    # private key
-    priv_s = (
-        raw.get("privateKeyB64")
-        or raw.get("privateKey")
-        or raw.get("secretKey")
-        or raw.get("ed25519PrivateKey")
-        or raw.get("private_key")
-        or ""
-    )
-    priv_raw = _b64_any_decode(str(priv_s)) if priv_s else b""
+    # 3) fallback base64/base64url
+    if not priv_raw:
+        priv_s = (
+            raw.get("privateKeyB64")
+            or raw.get("privateKey")
+            or raw.get("secretKey")
+            or raw.get("ed25519PrivateKey")
+            or raw.get("private_key")
+            or ""
+        )
+        if priv_s:
+            priv_raw = _b64_any_decode(str(priv_s))
 
-    # Alcuni formati memorizzano 64 bytes (seed+pub). cryptography vuole 32.
+    if not pub_raw:
+        pub_s = (
+            raw.get("publicKey")
+            or raw.get("publicKeyB64")
+            or raw.get("publicKeyBase64")
+            or raw.get("public_key")
+            or ""
+        )
+        if pub_s:
+            pub_raw = _b64_any_decode(str(pub_s))
+
+    # Normalizza priv 64->32
     if len(priv_raw) == 64:
         priv_raw = priv_raw[:32]
 
     if len(priv_raw) != 32:
         raise RuntimeError(f"Invalid Ed25519 private key length: {len(priv_raw)} (expected 32)")
 
-    # Se non abbiamo pub, deriviamola dal priv.
+    # Deriva pub se mancante
     priv = Ed25519PrivateKey.from_private_bytes(priv_raw)
     if not pub_raw:
-        pub_raw = priv.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw,
-        )
+        pub_raw = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
+    if len(pub_raw) != 32:
+        raise RuntimeError(f"Invalid Ed25519 public key length: {len(pub_raw)} (expected 32)")
+
+    # Deriva id se mancante
     if not dev_id:
-        # Se id non è presente nel file, deriviamo fingerprint da pub
         dev_id = hashlib.sha256(pub_raw).hexdigest()
 
     return dev_id, pub_raw, priv_raw
@@ -312,7 +360,7 @@ class OpenClawWSClient:
         self._rpc_timeout = float(_env("OPENCLAW_WS_RPC_TIMEOUT", "20") or "20")
 
         # identity source
-        self._identity_file = _env("OPENCLAW_IDENTITY_FILE")
+        self._identity_file = _env("OPENCLAW_IDENTITY_FILE") or str(Path.home() / ".openclaw" / "identity" / "device.json")
         self._state_dir = _state_dir()
 
         # cached identity
@@ -336,7 +384,7 @@ class OpenClawWSClient:
         raw_ident: Optional[dict] = None
 
         if self._identity_file:
-            p = Path(self._identity_file).expanduser()
+            p = Path(self._identity_file).expanduser().resolve()
             raw_ident = _load_identity_from_cli_file(p)
 
         if raw_ident is None:
@@ -439,7 +487,7 @@ class OpenClawWSClient:
                 if not nonce:
                     raise RuntimeError("connect.challenge missing nonce")
 
-                # 2) build connect params from ENV (these MUST match your gateway schema)
+                # 2) build connect params from ENV (must match gateway schema)
                 client_id = _get_client_id()
                 client_mode = _get_client_mode()
                 role = _get_role()
@@ -456,7 +504,6 @@ class OpenClawWSClient:
                 )
 
                 connect_params: Dict[str, Any] = {
-                    # Protocol is strict in your build: keep 3/3 unless you know otherwise
                     "minProtocol": 3,
                     "maxProtocol": 3,
                     "client": {
@@ -467,16 +514,11 @@ class OpenClawWSClient:
                     },
                     "role": role,
                     "scopes": scopes,
-
-                    # Common optional fields that some schema variants still require (even if empty)
                     "caps": [],
                     "commands": [],
                     "permissions": {},
-
                     "locale": _env("OPENCLAW_LOCALE", "en-US"),
                     "userAgent": _env("OPENCLAW_USER_AGENT", "openclaw-bff/0.1.0"),
-
-                    # token may be required both in header and in auth.token
                     "auth": {"token": token} if token else {},
                     "device": device,
                 }
@@ -493,7 +535,7 @@ class OpenClawWSClient:
                     raw=hello_payload,
                 )
 
-                # Start listener AFTER handshake (avoids races during connect)
+                # Start listener AFTER handshake
                 self._listener_task = asyncio.create_task(self._listener())
 
                 return self.hello
@@ -518,7 +560,6 @@ class OpenClawWSClient:
     async def _rpc_handshake(self, method: str, params: dict, timeout: float) -> Any:
         """
         RPC minimale SOLO per handshake (prima del listener).
-        Invia req e aspetta un res matching id.
         """
         assert self._ws is not None
         req_id = uuid.uuid4().hex
@@ -565,21 +606,16 @@ class OpenClawWSClient:
     async def subscribe(self, event_name: str, run_id: Optional[str] = None) -> AsyncGenerator[WSEvent, None]:
         """
         Sottoscrive eventi gateway:
-        - event_name: ad es. "agent", "chat", ecc.
+        - event_name: es. "agent", "chat", ecc.
         - run_id: se fornito, filtra payload.runId == run_id
-
-        NOTA: la tua build emette 'event' con shape:
-          {"type":"event","event":"agent","payload":{...,"runId":"...","stream":"tool|assistant|lifecycle",...}}
         """
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._subs.append((event_name, run_id, q))
-
         try:
             while True:
                 item = await q.get()
                 yield item
         finally:
-            # remove subscriber
             self._subs = [s for s in self._subs if s[2] is not q]
 
     async def _listener(self) -> None:
@@ -613,25 +649,20 @@ class OpenClawWSClient:
 
                     ws_event = WSEvent(event=ev, payload=payload)
 
-                    # broadcast to subscribers
                     for wanted_ev, wanted_run, q in list(self._subs):
                         if wanted_ev != ev:
                             continue
                         if wanted_run and wanted_run != run_id:
                             continue
-                        # non bloccare listener
                         try:
                             q.put_nowait(ws_event)
                         except asyncio.QueueFull:
-                            # drop if slow consumer
                             pass
 
                 else:
-                    # ignore unknown
                     pass
 
         except Exception:
-            # fail pending futures on disconnect
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError("WebSocket closed"))
