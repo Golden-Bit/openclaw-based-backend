@@ -96,7 +96,13 @@ async def _run_agent_and_collect(
 ) -> tuple[str, list[dict], str]:
     """Esegue un turn agentico via WS e raccoglie testo + eventi tool."""
 
-    params: Dict[str, Any] = {"agentId": agent_id, "message": message}
+    # OpenClaw richiede un idempotencyKey per l'RPC `agent` (schema strict).
+    # In caso di retry lato client (es. FE), usare sempre lo stesso valore.
+    params: Dict[str, Any] = {
+        "agentId": agent_id,
+        "message": message,
+        "idempotencyKey": uuid.uuid4().hex,
+    }
     if session_key:
         params["sessionKey"] = session_key
 
