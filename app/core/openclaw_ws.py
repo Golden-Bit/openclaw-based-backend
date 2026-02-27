@@ -82,9 +82,16 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _parse_scopes(raw: str) -> List[str]:
+    """Parsa una lista scopes da stringa comma-separated (es: "a,b,c")."""
+
+    return [p.strip() for p in (raw or "").split(",") if p.strip()]
+
+
 def _default_state_dir() -> Path:
-    # Stato persistente BFF (chiavi device + deviceToken). Non usare /tmp.
-    base = os.getenv("OPENCLAW_BFF_STATE_DIR")
+    # Stato persistente (chiavi device + deviceToken).
+    # Compat: alcuni setup usano OPENCLAW_STATE_DIR, altri OPENCLAW_BFF_STATE_DIR.
+    base = os.getenv("OPENCLAW_STATE_DIR") or os.getenv("OPENCLAW_BFF_STATE_DIR")
     if base:
         return Path(base).expanduser().resolve()
     return Path.home() / ".openclaw-bff"
@@ -100,6 +107,21 @@ def _device_token_path(state_dir: Path) -> Path:
 
 def _load_device_identity(state_dir: Path) -> dict:
     """Carica identità dal file state; se assente, genera e salva."""
+
+    # Se l'utente ha già una device identity del CLI, può riutilizzarla:
+    # OPENCLAW_IDENTITY_FILE=~/.openclaw/identity/device.json
+    override = os.getenv("OPENCLAW_IDENTITY_FILE")
+    if override:
+        op = Path(override).expanduser()
+        if op.exists():
+            try:
+                j = json.loads(op.read_text(encoding="utf-8"))
+                # Ci aspettiamo i campi (o equivalenti) usati da questo BFF.
+                # Se la shape è diversa, ignoriamo e usiamo l'identità del BFF.
+                if all(k in j for k in ("id", "publicKey", "privateKeyB64")):
+                    return j
+            except Exception:
+                pass
 
     state_dir.mkdir(parents=True, exist_ok=True)
     p = _identity_path(state_dir)
@@ -188,9 +210,32 @@ class OpenClawWSClient:
             if self._ws is not None and self.hello is None:
                 await self.close()
 
+            # ------------------------------------------------------------------
+            # Auth + client identity (DA ENV)
+            #
+            # La tua installazione OpenClaw valida rigidamente `client.mode` (e spesso anche `client.id`)
+            # contro un set di costanti nel JSON schema. Quindi non possiamo hardcodare valori "operator".
+            #
+            # Usiamo questi env (che tu hai già nel tuo .env funzionante):
+            # - OPENCLAW_CLIENT_ID
+            # - OPENCLAW_CLIENT_MODE
+            # - OPENCLAW_ROLE
+            # - OPENCLAW_SCOPES (comma-separated)
+            #
+            # Nota token:
+            # - in Settings abbiamo OPENCLAW_GATEWAY_TOKEN -> settings.openclaw_bearer_token
+            # - ma alcuni .env usano OPENCLAW_BEARER_TOKEN. Supportiamo entrambe.
+            # ------------------------------------------------------------------
+
+            bearer = settings.openclaw_bearer_token or os.getenv("OPENCLAW_BEARER_TOKEN") or ""
+            client_id = os.getenv("OPENCLAW_CLIENT_ID", "cli")
+            client_mode = os.getenv("OPENCLAW_CLIENT_MODE", "backend")
+            role = os.getenv("OPENCLAW_ROLE", "operator")
+            scopes = _parse_scopes(os.getenv("OPENCLAW_SCOPES", "operator.read,operator.write"))
+
             additional_headers: Optional[List[Tuple[str, str]]] = None
-            if settings.openclaw_bearer_token:
-                additional_headers = [("Authorization", f"Bearer {settings.openclaw_bearer_token}")]
+            if bearer:
+                additional_headers = [("Authorization", f"Bearer {bearer}")]
 
             try:
                 # 1) open socket
@@ -218,11 +263,11 @@ class OpenClawWSClient:
                     ident=ident,
                     nonce=nonce,
                     ts=ts,
-                    client_id="cli",
-                    client_mode="operator",
-                    role="operator",
-                    scopes=["operator.read", "operator.write"],
-                    token=(device_token or settings.openclaw_bearer_token or ""),
+                    client_id=client_id,
+                    client_mode=client_mode,
+                    role=role,
+                    scopes=scopes,
+                    token=(device_token or bearer),
                 )
 
                 # 4) connect params (schema-strict)
@@ -230,17 +275,17 @@ class OpenClawWSClient:
                     "minProtocol": 3,
                     "maxProtocol": 3,
                     "client": {
-                        "id": "cli",
+                        "id": client_id,
                         "version": os.getenv("OPENCLAW_CLIENT_VERSION", "openclaw-bff/0.1.0"),
                         "platform": self._platform_string(),
-                        "mode": "operator",
+                        "mode": client_mode,
                     },
-                    "role": "operator",
-                    "scopes": ["operator.read", "operator.write"],
+                    "role": role,
+                    "scopes": scopes,
                     "caps": [],
                     "commands": [],
                     "permissions": {},
-                    "auth": {"token": settings.openclaw_bearer_token or ""},
+                    "auth": {"token": bearer},
                     "locale": os.getenv("OPENCLAW_LOCALE", "en-US"),
                     "userAgent": os.getenv("OPENCLAW_USER_AGENT", "openclaw-bff/0.1.0"),
                     "device": device,

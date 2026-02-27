@@ -15,14 +15,17 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
+import os
 
 from app.core.config import settings
 
 
 def _auth_headers() -> Dict[str, str]:
     h: Dict[str, str] = {}
-    if settings.openclaw_bearer_token:
-        h["Authorization"] = f"Bearer {settings.openclaw_bearer_token}"
+    # Compat: supporta sia OPENCLAW_GATEWAY_TOKEN (Settings) sia OPENCLAW_BEARER_TOKEN
+    bearer = settings.openclaw_bearer_token or os.getenv("OPENCLAW_BEARER_TOKEN")
+    if bearer:
+        h["Authorization"] = f"Bearer {bearer}"
     return h
 
 
