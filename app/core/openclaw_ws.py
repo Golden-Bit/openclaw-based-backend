@@ -23,6 +23,11 @@ Auth token:
   A) Header HTTP del WebSocket handshake: Authorization: Bearer <token>
   B) Campo connect_params.auth.token (alcune build lo usano)
 
+Compatibilità websockets:
+- Con websockets >= 15/16 l'argomento per gli header si chiama `additional_headers`
+  (NON `extra_headers`).
+  Signature (16.0): websockets.connect(..., additional_headers=..., ...)
+
 Bug fixes rispetto alla versione base:
 - connect() non ritorna mai None: o WSHello o eccezione
 - se la prima handshake fallisce, pulisce _ws e hello (evita stato half-open)
@@ -37,7 +42,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 import websockets
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -121,17 +126,20 @@ class OpenClawWSClient:
                 await self.close()
 
             # Prepare auth header (best compatibility)
-            extra_headers = None
+            additional_headers: Optional[List[Tuple[str, str]]] = None
             if settings.openclaw_bearer_token:
-                extra_headers = {"Authorization": f"Bearer {settings.openclaw_bearer_token}"}
+                additional_headers = [("Authorization", f"Bearer {settings.openclaw_bearer_token}")]
 
             try:
+                # IMPORTANT: websockets 16.x uses `additional_headers` (not extra_headers)
                 self._ws = await websockets.connect(
                     self.url,
                     max_size=10 * 1024 * 1024,
-                    extra_headers=extra_headers,
+                    additional_headers=additional_headers,
                     ping_interval=20,
                     ping_timeout=20,
+                    open_timeout=10,
+                    close_timeout=10,
                 )
 
                 # Start listener ASAP (so we can receive events/responses)
