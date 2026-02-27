@@ -37,6 +37,20 @@ class Settings(BaseSettings):
     openclaw_ws_url: str = Field(default="ws://127.0.0.1:3434/ws", alias="OPENCLAW_WS_URL")
     openclaw_bearer_token: str | None = Field(default=None, alias="OPENCLAW_BEARER_TOKEN")
     openclaw_default_agent_id: str = Field(default="main", alias="OPENCLAW_DEFAULT_AGENT_ID")
+    # OpenClaw client identity (schema-valid)
+    openclaw_client_id: str = Field(default="gateway-client", alias="OPENCLAW_CLIENT_ID")
+    openclaw_client_mode: str = Field(default="backend", alias="OPENCLAW_CLIENT_MODE")
+    # Authz
+    openclaw_role: str = Field(default="operator", alias="OPENCLAW_ROLE")
+    openclaw_scopes: str = Field(default="operator.read,operator.write", alias="OPENCLAW_SCOPES")
+    # Device identity persistence
+    openclaw_state_dir: str | None = Field(default=None, alias="OPENCLAW_STATE_DIR")
+    openclaw_identity_file: str | None = Field(default=None, alias="OPENCLAW_IDENTITY_FILE")
+    openclaw_use_device_token: bool = Field(default=True, alias="OPENCLAW_USE_DEVICE_TOKEN")
+    # WS timeouts
+    openclaw_ws_connect_timeout: float = Field(default=10.0, alias="OPENCLAW_WS_CONNECT_TIMEOUT")
+    openclaw_ws_rpc_timeout: float = Field(default=20.0, alias="OPENCLAW_WS_RPC_TIMEOUT")
+    openclaw_ws_challenge_timeout: float = Field(default=2.0, alias="OPENCLAW_WS_CHALLENGE_TIMEOUT")
 
     # Keycloak
     keycloak_enabled: bool = Field(default=False, alias="KEYCLOAK_ENABLED")
