@@ -1,34 +1,33 @@
-"""
-Client WebSocket (RPC) verso OpenClaw Gateway.
+"""Client WebSocket (RPC) verso OpenClaw Gateway.
 
-Frame JSON:
-- req:  richiesta RPC (method + params)
-- res:  risposta (ok/payload | ok=false/error)
-- event: eventi server -> client (es: connect.challenge, streaming, broadcast)
+Questo modulo implementa un client *robusto* per il protocollo WS di OpenClaw.
 
-Handshake (server side):
-- Il PRIMO request del client deve essere method="connect" e params devono validare lo schema.
-  In caso contrario: INVALID_REQUEST e close(1008).  (vedi message-handler.ts)
-- Il server può inviare prima un event connect.challenge con { nonce, ts }.
-- minProtocol/maxProtocol devono includere PROTOCOL_VERSION (attualmente 3).
+Perché serve:
+- il Gateway WS è l'unico canale che espone la *Agent Loop pipeline completa*.
+- tramite WS possiamo ricevere eventi separati per stream: assistant/text, tool, lifecycle, ecc.
 
-Client schema (importante per questo bug):
-- client.id deve essere uno dei GATEWAY_CLIENT_IDS (es: "gateway-client", "cli", ...)
-- client.mode deve essere uno dei GATEWAY_CLIENT_MODES:
-  webchat | cli | ui | backend | node | probe | test
-  (NON "operator", NON "bff").
+Frame types (Gateway Protocol):
+- req  (client -> server) : {type:'req', id, method, params}
+- res  (server -> client) : {type:'res', id, ok, payload|error}
+- event(server -> client) : {type:'event', event, payload, ...}
 
-Device auth:
-- Se vuoi che il gateway ti conceda scopes reali (operator.read/write), di solito serve una device identity,
-  perché il gateway “default-deny” e può azzerare scopes se non riesce a legarli a un device/token.
-- Il payload firmato deve essere EXACT match di buildDeviceAuthPayload() lato OpenClaw:
-  v1|deviceId|clientId|clientMode|role|scopesCsv|signedAtMs|token
-  v2 aggiunge |nonce se presente.
+Handshake richiesto:
+1) gateway -> event connect.challenge { nonce, ts }
+2) client  -> req connect { params ... }
+3) gateway -> res hello-ok (protocol/policy/features + eventuale auth.deviceToken)
 
-Questo file:
-- non va mai in deadlock (connect() NON chiama call("connect"))
-- non lascia stato half-open (_ws valorizzato ma hello None)
-- usa timeouts espliciti (niente attese infinite)
+Compatibilità websockets:
+- websockets >= 15/16 usa `additional_headers` (non `extra_headers`).
+
+Device identity:
+- Il Gateway richiede una device identity firmata. Qui generiamo una Ed25519 al primo avvio
+  e la persistiamo su disco (state dir).
+- La firma usa un payload deterministico v2. Se la tua build richiede un payload diverso,
+  modifica `_sign_device_v2()`.
+
+Event bus:
+- puoi iscriverti a `subscribe(event_name, run_id)` e ricevere frame `event` filtrati
+  opzionalmente per runId (utile per `event: agent` dell'agent loop).
 """
 
 from __future__ import annotations
@@ -42,33 +41,33 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 import websockets
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from app.core.config import settings
 
-# Protocol version nel gateway (OpenClaw)
-PROTOCOL_VERSION = 3
-
-
-# ---------------------------
-# Models
-# ---------------------------
 
 @dataclass
 class WSHello:
+    """Rappresentazione minimale del payload hello-ok."""
+
     protocol: int
     features: dict
     policy: dict
     raw: dict
 
 
-# ---------------------------
-# base64url helpers (NO padding) - come infra/device-identity.ts
-# ---------------------------
+@dataclass
+class WSEvent:
+    """Evento gateway generico (frame type='event')."""
+
+    event: str
+    payload: dict
+    frame: dict
+
 
 def _b64url_encode(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
@@ -83,92 +82,30 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# ---------------------------
-# Device identity (compatibile col formato OpenClaw device.json)
-# ---------------------------
-
-def _expand_path(p: str) -> Path:
-    return Path(os.path.expandvars(os.path.expanduser(p))).resolve()
-
-
 def _default_state_dir() -> Path:
-    # Se l'utente ha già OpenClaw, preferiamo riusare ~/.openclaw (se esiste)
-    home = Path.home()
-    candidate = home / ".openclaw"
-    if candidate.exists():
-        return candidate
-    return home / ".openclaw-bff"
+    # Stato persistente BFF (chiavi device + deviceToken). Non usare /tmp.
+    base = os.getenv("OPENCLAW_BFF_STATE_DIR")
+    if base:
+        return Path(base).expanduser().resolve()
+    return Path.home() / ".openclaw-bff"
 
 
-def _resolve_identity_file() -> Path:
-    # Priorità:
-    # 1) OPENCLAW_IDENTITY_FILE (se impostato)
-    # 2) OPENCLAW_STATE_DIR/identity/device.json (se OPENCLAW_STATE_DIR impostato)
-    # 3) default_state_dir()/identity/device.json
-    if getattr(settings, "openclaw_identity_file", None):
-        return _expand_path(settings.openclaw_identity_file)  # type: ignore[attr-defined]
-
-    if getattr(settings, "openclaw_state_dir", None):
-        sd = _expand_path(settings.openclaw_state_dir)  # type: ignore[attr-defined]
-        return sd / "identity" / "device.json"
-
-    return _default_state_dir() / "identity" / "device.json"
+def _identity_path(state_dir: Path) -> Path:
+    return state_dir / "device_identity.json"
 
 
-def _ensure_parent(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
+def _device_token_path(state_dir: Path) -> Path:
+    return state_dir / "device_token.json"
 
 
-def _derive_device_id_from_pub_raw(pub_raw_32: bytes) -> str:
-    # OpenClaw usa sha256(pub_raw) hex
-    return hashlib.sha256(pub_raw_32).hexdigest()
+def _load_device_identity(state_dir: Path) -> dict:
+    """Carica identità dal file state; se assente, genera e salva."""
 
+    state_dir.mkdir(parents=True, exist_ok=True)
+    p = _identity_path(state_dir)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
 
-def _load_or_create_identity(identity_file: Path) -> tuple[str, str, Ed25519PrivateKey]:
-    """
-    Ritorna:
-      (device_id_hex, public_key_raw_b64url, private_key_obj)
-
-    Formato file compatibile con OpenClaw (infra/device-identity.ts):
-      {
-        "version": 1,
-        "deviceId": "<sha256(pubRaw) hex>",
-        "publicKeyPem": "-----BEGIN PUBLIC KEY----- ...",
-        "privateKeyPem": "-----BEGIN PRIVATE KEY----- ...",
-        "createdAtMs": 123
-      }
-    """
-    _ensure_parent(identity_file)
-
-    if identity_file.exists():
-        data = json.loads(identity_file.read_text(encoding="utf-8"))
-        pub_pem = data.get("publicKeyPem")
-        priv_pem = data.get("privateKeyPem")
-        if isinstance(pub_pem, str) and isinstance(priv_pem, str):
-            priv = serialization.load_pem_private_key(priv_pem.encode("utf-8"), password=None)
-            if not isinstance(priv, Ed25519PrivateKey):
-                raise RuntimeError("Device private key is not Ed25519")
-
-            pub = priv.public_key()
-            pub_raw = pub.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw,
-            )
-            dev_id = _derive_device_id_from_pub_raw(pub_raw)
-            pub_b64url = _b64url_encode(pub_raw)
-
-            # Se deviceId nel file è diverso (file vecchio/corrotto), lo correggiamo
-            if data.get("deviceId") != dev_id:
-                data["deviceId"] = dev_id
-                identity_file.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-                try:
-                    os.chmod(identity_file, 0o600)
-                except Exception:
-                    pass
-
-            return dev_id, pub_b64url, priv  # type: ignore[return-value]
-
-    # Genera nuova identità (Ed25519)
     priv = Ed25519PrivateKey.generate()
     pub = priv.public_key()
 
@@ -176,182 +113,152 @@ def _load_or_create_identity(identity_file: Path) -> tuple[str, str, Ed25519Priv
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
-    dev_id = _derive_device_id_from_pub_raw(pub_raw)
-    pub_b64url = _b64url_encode(pub_raw)
+    dev_id = hashlib.sha256(pub_raw).hexdigest()
 
-    pub_pem = pub.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("utf-8")
-
-    priv_pem = priv.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
+    priv_raw = priv.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
         encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
+    )
 
-    payload = {
-        "version": 1,
-        "deviceId": dev_id,
-        "publicKeyPem": pub_pem,
-        "privateKeyPem": priv_pem,
-        "createdAtMs": _now_ms(),
+    ident = {
+        "id": dev_id,
+        "publicKey": _b64url_encode(pub_raw),
+        "privateKeyB64": _b64url_encode(priv_raw),
     }
-    identity_file.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    try:
-        os.chmod(identity_file, 0o600)
-    except Exception:
-        pass
-
-    return dev_id, pub_b64url, priv
+    p.write_text(json.dumps(ident, indent=2), encoding="utf-8")
+    return ident
 
 
-def _device_token_file(identity_file: Path) -> Path:
-    # accanto a identity/device.json → identity/device-auth.json (nome simile a OpenClaw)
-    return identity_file.parent / "device-auth.json"
-
-
-def _load_device_token(identity_file: Path) -> Optional[str]:
-    p = _device_token_file(identity_file)
+def _load_device_token(state_dir: Path) -> Optional[str]:
+    p = _device_token_path(state_dir)
     if not p.exists():
         return None
     try:
         j = json.loads(p.read_text(encoding="utf-8"))
-        # formato “nostro”: { "deviceToken": "...", "savedAtMs": ... }
-        tok = j.get("deviceToken")
-        return tok if isinstance(tok, str) and tok else None
+        return j.get("deviceToken")
     except Exception:
         return None
 
 
-def _save_device_token(identity_file: Path, device_token: str) -> None:
-    p = _device_token_file(identity_file)
-    _ensure_parent(p)
-    payload = {"deviceToken": device_token, "savedAtMs": _now_ms()}
-    p.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    try:
-        os.chmod(p, 0o600)
-    except Exception:
-        pass
+def _save_device_token(state_dir: Path, device_token: str, meta: dict) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"deviceToken": device_token, "meta": meta, "savedAtMs": _now_ms()}
+    _device_token_path(state_dir).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-
-# ---------------------------
-# Device auth payload (EXACT match OpenClaw buildDeviceAuthPayload)
-# ---------------------------
-
-def _build_device_auth_payload(
-    *,
-    device_id: str,
-    client_id: str,
-    client_mode: str,
-    role: str,
-    scopes: List[str],
-    signed_at_ms: int,
-    token: str,
-    nonce: Optional[str],
-) -> str:
-    """
-    OpenClaw buildDeviceAuthPayload():
-      version = (nonce ? "v2" : "v1")
-      scopesCsv = scopes.join(",")
-      base = [version, deviceId, clientId, clientMode, role, scopesCsv, signedAtMs, token]
-      if v2: base.push(nonce)
-      return base.join("|")
-    """
-    version = "v2" if nonce else "v1"
-    scopes_csv = ",".join(scopes)
-    parts = [
-        version,
-        device_id,
-        client_id,
-        client_mode,
-        role,
-        scopes_csv,
-        str(signed_at_ms),
-        token or "",
-    ]
-    if version == "v2":
-        parts.append(nonce or "")
-    return "|".join(parts)
-
-
-# ---------------------------
-# Client
-# ---------------------------
 
 class OpenClawWSClient:
+    """WS RPC client verso OpenClaw Gateway."""
+
     def __init__(self, url: str):
         self.url = url
 
-        self._ws: Optional[Any] = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._listener_task: Optional[asyncio.Task] = None
+
+        # Pending requests: req_id -> Future(payload)
         self._pending: Dict[str, asyncio.Future] = {}
 
         self.hello: Optional[WSHello] = None
         self._lock = asyncio.Lock()
 
-        # timeouts
-        self._connect_timeout = float(getattr(settings, "openclaw_ws_connect_timeout", 10.0))
-        self._rpc_timeout = float(getattr(settings, "openclaw_ws_rpc_timeout", 20.0))
-        self._challenge_timeout = float(getattr(settings, "openclaw_ws_challenge_timeout", 2.0))
+        # Timeouts (evitano attese infinite)
+        self._connect_timeout = float(os.getenv("OPENCLAW_WS_CONNECT_TIMEOUT", "10"))
+        self._rpc_timeout = float(os.getenv("OPENCLAW_WS_RPC_TIMEOUT", "20"))
 
-        # identity paths
-        self._identity_file = _resolve_identity_file()
+        # Stato persistente (device identity + device token)
+        self._state_dir = _default_state_dir()
 
-    # ---------------------------
-    # Connection + handshake
-    # ---------------------------
+        # Event subscriptions: list[(event_name, run_id, queue)]
+        self._subs_lock = asyncio.Lock()
+        self._subs: List[Tuple[str, Optional[str], asyncio.Queue]] = []
+
+    # ------------------------------------------------------------------
+    # Handshake
+    # ------------------------------------------------------------------
 
     async def connect(self) -> WSHello:
-        """
-        Connette e completa handshake (connect).
+        """Connette e completa l'handshake."""
 
-        NOTE:
-        - Non chiama call("connect") → niente deadlock.
-        - Se fallisce → close() e rilancia eccezione.
-        """
         async with self._lock:
             if self._ws is not None and self.hello is not None:
                 return self.hello
 
-            # half-open cleanup
+            # Half-open cleanup
             if self._ws is not None and self.hello is None:
                 await self.close()
 
-            # WS handshake headers (websockets 16 usa additional_headers)
             additional_headers: Optional[List[Tuple[str, str]]] = None
             if settings.openclaw_bearer_token:
                 additional_headers = [("Authorization", f"Bearer {settings.openclaw_bearer_token}")]
 
             try:
+                # 1) open socket
                 self._ws = await websockets.connect(
                     self.url,
-                    additional_headers=additional_headers,
                     max_size=10 * 1024 * 1024,
-                    open_timeout=self._connect_timeout,
-                    close_timeout=10,
+                    additional_headers=additional_headers,
                     ping_interval=20,
                     ping_timeout=20,
+                    open_timeout=self._connect_timeout,
+                    close_timeout=10,
                 )
 
-                # 1) Best-effort: leggi challenge (se arriva). Non bloccare troppo.
-                nonce, ts = await self._recv_challenge_best_effort()
+                # 2) receive challenge
+                challenge = await self._recv_challenge()
+                nonce = str(challenge.get("nonce") or "")
+                ts = int(challenge.get("ts") or _now_ms())
+                if not nonce:
+                    raise RuntimeError("connect.challenge missing nonce")
 
-                # 2) Costruisci connect params validi per schema (client.mode deve essere ENUM!)
-                connect_params = self._build_connect_params(nonce=nonce, ts=ts)
+                # 3) device identity + signature
+                ident = _load_device_identity(self._state_dir)
+                device_token = _load_device_token(self._state_dir)
+                device = self._sign_device_v2(
+                    ident=ident,
+                    nonce=nonce,
+                    ts=ts,
+                    client_id="cli",
+                    client_mode="operator",
+                    role="operator",
+                    scopes=["operator.read", "operator.write"],
+                    token=(device_token or settings.openclaw_bearer_token or ""),
+                )
 
-                # 3) Invia connect come PRIMO req del client e attendi res
-                hello_payload = await self._handshake_connect(connect_params, timeout=self._connect_timeout)
+                # 4) connect params (schema-strict)
+                connect_params: Dict[str, Any] = {
+                    "minProtocol": 3,
+                    "maxProtocol": 3,
+                    "client": {
+                        "id": "cli",
+                        "version": os.getenv("OPENCLAW_CLIENT_VERSION", "openclaw-bff/0.1.0"),
+                        "platform": self._platform_string(),
+                        "mode": "operator",
+                    },
+                    "role": "operator",
+                    "scopes": ["operator.read", "operator.write"],
+                    "caps": [],
+                    "commands": [],
+                    "permissions": {},
+                    "auth": {"token": settings.openclaw_bearer_token or ""},
+                    "locale": os.getenv("OPENCLAW_LOCALE", "en-US"),
+                    "userAgent": os.getenv("OPENCLAW_USER_AGENT", "openclaw-bff/0.1.0"),
+                    "device": device,
+                }
 
+                # 5) handshake RPC (single response)
+                hello_payload = await self._rpc_handshake("connect", connect_params, timeout=self._connect_timeout)
                 if not isinstance(hello_payload, dict):
                     raise RuntimeError(f"Unexpected hello payload type: {type(hello_payload)}")
 
-                # salva deviceToken se presente (utile per reconnect futuri)
-                auth = hello_payload.get("auth")
-                if isinstance(auth, dict):
-                    dt = auth.get("deviceToken")
-                    if isinstance(dt, str) and dt:
-                        _save_device_token(self._identity_file, dt)
+                # Save deviceToken if provided
+                auth = hello_payload.get("auth") or {}
+                if isinstance(auth, dict) and auth.get("deviceToken"):
+                    _save_device_token(
+                        self._state_dir,
+                        auth["deviceToken"],
+                        meta={"role": auth.get("role"), "scopes": auth.get("scopes")},
+                    )
 
                 self.hello = WSHello(
                     protocol=int(hello_payload.get("protocol", 0)),
@@ -360,152 +267,107 @@ class OpenClawWSClient:
                     raw=hello_payload,
                 )
 
-                # 4) Start listener post-handshake
+                # 6) start listener post-handshake
                 self._listener_task = asyncio.create_task(self._listener())
-
                 return self.hello
 
             except Exception:
                 await self.close()
                 raise
 
-    async def _recv_challenge_best_effort(self) -> tuple[Optional[str], Optional[int]]:
-        """
-        Prova a ricevere connect.challenge.
-        - Se arriva: ritorna (nonce, ts)
-        - Se non arriva entro _challenge_timeout: ritorna (None, None) e si procede (payload v1)
-        """
+    async def _recv_challenge(self) -> dict:
         assert self._ws is not None
-        try:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=self._challenge_timeout)
-        except asyncio.TimeoutError:
-            return None, None
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=self._connect_timeout)
+        data = json.loads(raw)
+        if data.get("type") != "event" or data.get("event") != "connect.challenge":
+            raise RuntimeError(
+                f"Expected connect.challenge event, got: {data.get('type')} {data.get('event')}"
+            )
+        payload = data.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("connect.challenge payload is not an object")
+        return payload
 
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return None, None
+    def _platform_string(self) -> str:
+        p = os.sys.platform
+        if p.startswith("linux"):
+            return "linux"
+        if p.startswith("darwin"):
+            return "macos"
+        if p.startswith("win"):
+            return "windows"
+        return "linux"
 
-        if data.get("type") == "event" and data.get("event") == "connect.challenge":
-            payload = data.get("payload") or {}
-            if isinstance(payload, dict):
-                nonce = payload.get("nonce")
-                ts = payload.get("ts")
-                return (str(nonce) if nonce else None, int(ts) if isinstance(ts, (int, float)) else None)
+    def _sign_device_v2(
+        self,
+        ident: dict,
+        nonce: str,
+        ts: int,
+        client_id: str,
+        client_mode: str,
+        role: str,
+        scopes: List[str],
+        token: str,
+    ) -> dict:
+        """Firma v2 (legacy) con nonce server.
 
-        # Se non è challenge, lo ignoriamo (nel caso reale, challenge è quasi sempre il primo frame server->client)
-        return None, None
-
-    def _build_connect_params(self, nonce: Optional[str], ts: Optional[int]) -> Dict[str, Any]:
+        Payload v2 (stringa deterministica):
+          v2|deviceId|clientId|clientMode|role|scopes_csv|ts|token|nonce
         """
-        Costruisce ConnectParams (schema-valid) + device signature compatibile.
 
-        Client defaults (BFF):
-        - client.id   = gateway-client
-        - client.mode = backend
-        Valori ammessi: webchat|cli|ui|backend|node|probe|test
-        """
-        client_id = getattr(settings, "openclaw_client_id", "gateway-client")
-        client_mode = getattr(settings, "openclaw_client_mode", "backend")
-        role = getattr(settings, "openclaw_role", "operator")
+        device_id = ident["id"]
+        pub_b64url = ident["publicKey"]
+        priv_raw = _b64url_decode(ident["privateKeyB64"])
+        priv = Ed25519PrivateKey.from_private_bytes(priv_raw)
+        scopes_csv = ",".join(scopes)
 
-        # scopes env: "a,b,c"
-        scopes_str = getattr(settings, "openclaw_scopes", "operator.read,operator.write")
-        scopes = [s.strip() for s in scopes_str.split(",") if s.strip()]
+        payload = "|".join(
+            [
+                "v2",
+                device_id,
+                client_id,
+                client_mode,
+                role,
+                scopes_csv,
+                str(ts),
+                token,
+                nonce,
+            ]
+        ).encode("utf-8")
 
-        signed_at = ts if isinstance(ts, int) and ts > 0 else _now_ms()
-
-        # Preferisci deviceToken salvato (se abilitato), altrimenti gateway token
-        use_device_token = bool(getattr(settings, "openclaw_use_device_token", True))
-        saved_device_token = _load_device_token(self._identity_file) if use_device_token else None
-        auth_token = saved_device_token or (settings.openclaw_bearer_token or "")
-
-        # Device identity + signature (consigliata per mantenere scopes; v2 se nonce presente)
-        device_id, pub_b64url, priv = _load_or_create_identity(self._identity_file)
-
-        payload = _build_device_auth_payload(
-            device_id=device_id,
-            client_id=client_id,
-            client_mode=client_mode,
-            role=role,
-            scopes=scopes,
-            signed_at_ms=signed_at,
-            token=auth_token,
-            nonce=nonce,
-        )
-        sig = priv.sign(payload.encode("utf-8"))
+        sig = priv.sign(payload)
         sig_b64url = _b64url_encode(sig)
-
-        device = {
-            "id": device_id,
-            "publicKey": pub_b64url,        # base64url(raw pub) - no padding
-            "signature": sig_b64url,        # base64url(sig) - no padding
-            "signedAt": signed_at,          # ms
-        }
-        if nonce:
-            device["nonce"] = nonce
-
-        # ConnectParams (schema)
         return {
-            "minProtocol": PROTOCOL_VERSION,
-            "maxProtocol": PROTOCOL_VERSION,
-            "client": {
-                "id": client_id,
-                "mode": client_mode,
-                "version": os.getenv("BFF_VERSION", "0.1.0"),
-                "platform": os.getenv("BFF_PLATFORM", "linux"),
-                "displayName": os.getenv("BFF_DISPLAY_NAME", "OpenClaw BFF"),
-            },
-            "role": role,  # server accetta operator|node
-            "scopes": scopes,
-            # campi “presenti anche se vuoti” (tollerati dallo schema)
-            "caps": [],
-            "commands": [],
-            "permissions": {},
-            "locale": os.getenv("OPENCLAW_LOCALE", "en-US"),
-            "userAgent": os.getenv("OPENCLAW_USER_AGENT", "openclaw-bff/0.1.0"),
-            "auth": {
-                # per handshake: token condiviso o deviceToken (se presente)
-                "token": auth_token,
-            },
-            "device": device,
+            "id": device_id,
+            "publicKey": pub_b64url,
+            "signature": sig_b64url,
+            "signedAt": ts,
+            "nonce": nonce,
         }
 
-    async def _handshake_connect(self, params: Dict[str, Any], timeout: float) -> Any:
-        """
-        Invia req connect e aspetta res connect (ok/payload).
-        Durante handshake NON usiamo il listener/pending map (più semplice, meno race).
-        """
+    async def _rpc_handshake(self, method: str, params: dict, timeout: float) -> Any:
+        """RPC minimale usata SOLO durante handshake (prima del listener)."""
+
         assert self._ws is not None
         req_id = uuid.uuid4().hex
+        await self._ws.send(
+            json.dumps({"type": "req", "id": req_id, "method": method, "params": params})
+        )
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+        data = json.loads(raw)
+        if data.get("type") != "res" or data.get("id") != req_id:
+            raise RuntimeError(f"Unexpected handshake response frame: {data}")
+        if data.get("ok") is not True:
+            raise RuntimeError(str(data.get("error") or {}))
+        return data.get("payload")
 
-        await self._ws.send(json.dumps({"type": "req", "id": req_id, "method": "connect", "params": params}))
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=max(0.1, deadline - time.time()))
-            data = json.loads(raw)
-
-            # possono arrivare event vari; cerchiamo la res col nostro id
-            if data.get("type") == "res" and data.get("id") == req_id:
-                if data.get("ok") is True:
-                    return data.get("payload")
-                err = data.get("error") or {}
-                raise RuntimeError(str(err))
-
-        raise TimeoutError("WS handshake timed out waiting for connect response")
-
-    # ---------------------------
+    # ------------------------------------------------------------------
     # RPC post-handshake
-    # ---------------------------
+    # ------------------------------------------------------------------
 
-    async def call(self, method: str, params: dict | None = None, timeout: float | None = None) -> Any:
-        """
-        RPC standard dopo handshake.
-        """
+    async def call(self, method: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> Any:
         if self._ws is None or self.hello is None:
             await self.connect()
-
         assert self._ws is not None
 
         req_id = uuid.uuid4().hex
@@ -518,15 +380,57 @@ class OpenClawWSClient:
         await self._ws.send(json.dumps(frame))
         return await asyncio.wait_for(fut, timeout=timeout or self._rpc_timeout)
 
+    # ------------------------------------------------------------------
+    # Event subscriptions
+    # ------------------------------------------------------------------
+
+    async def subscribe(self, event_name: str, run_id: Optional[str] = None) -> AsyncGenerator[WSEvent, None]:
+        """Sottoscrive eventi gateway (frame event) filtrando opzionalmente per runId."""
+
+        q: asyncio.Queue = asyncio.Queue(maxsize=2000)
+        async with self._subs_lock:
+            self._subs.append((event_name, run_id, q))
+
+        try:
+            while True:
+                ev = await q.get()
+                if isinstance(ev, WSEvent) and ev.event == "__closed__":
+                    return
+                yield ev
+        finally:
+            async with self._subs_lock:
+                self._subs = [s for s in self._subs if s[2] is not q]
+
+    async def _fanout_event(self, event_name: str, payload: dict, frame: dict) -> None:
+        ev = WSEvent(event=event_name, payload=payload, frame=frame)
+        run_id = payload.get("runId") if isinstance(payload, dict) else None
+
+        async with self._subs_lock:
+            subs = list(self._subs)
+
+        for sub_event, sub_run, q in subs:
+            if sub_event != event_name:
+                continue
+            if sub_run is not None and run_id is not None and sub_run != run_id:
+                continue
+            try:
+                q.put_nowait(ev)
+            except asyncio.QueueFull:
+                # se il consumer è lento, droppiamo (meglio che bloccare la listener)
+                pass
+
+    # ------------------------------------------------------------------
+    # Listener
+    # ------------------------------------------------------------------
+
     async def _listener(self) -> None:
-        """
-        Listener loop: gestisce res (risolve future) + memorizza event utili.
-        """
         assert self._ws is not None
         try:
             async for msg in self._ws:
                 data = json.loads(msg)
-                if data.get("type") == "res":
+                t = data.get("type")
+
+                if t == "res":
                     req_id = data.get("id")
                     fut = self._pending.pop(req_id, None)
                     if fut and not fut.done():
@@ -534,23 +438,26 @@ class OpenClawWSClient:
                             fut.set_result(data.get("payload"))
                         else:
                             fut.set_exception(RuntimeError(str(data.get("error") or "WS RPC error")))
-                else:
-                    # eventi: per ora ignoriamo (aggiungeremo streaming più avanti)
-                    pass
+
+                elif t == "event":
+                    event_name = data.get("event") or ""
+                    payload = data.get("payload") or {}
+                    if isinstance(payload, dict):
+                        await self._fanout_event(event_name, payload, data)
+
         except Exception:
-            # fallisci pending futures
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(RuntimeError("WebSocket closed"))
             self._pending.clear()
 
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
     async def close(self) -> None:
-        """
-        Chiude WS e resetta stato (idempotente).
-        """
         if self._listener_task:
             self._listener_task.cancel()
-            self._listener_task = None
 
         if self._ws:
             try:
@@ -565,3 +472,13 @@ class OpenClawWSClient:
             if not fut.done():
                 fut.set_exception(RuntimeError("WS client closed"))
         self._pending.clear()
+
+        # chiudi anche tutte le subscription
+        async with self._subs_lock:
+            subs = list(self._subs)
+            self._subs.clear()
+        for _, _, q in subs:
+            try:
+                q.put_nowait(WSEvent(event="__closed__", payload={}, frame={}))
+            except Exception:
+                pass

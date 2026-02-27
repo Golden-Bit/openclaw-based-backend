@@ -1,16 +1,12 @@
-"""
-Client HTTP verso OpenClaw Gateway.
+"""Client HTTP verso OpenClaw Gateway.
 
-Supporta:
-- POST JSON (OpenResponses / ChatCompletions)
-- streaming SSE (OpenResponses / ChatCompletions)
+Questo client viene usato per gli endpoint HTTP OpenAI-compatibili esposti dal gateway
+(es. /v1/responses) e per eventuale streaming SSE.
 
 Nota importante:
-- NON usare raise_for_status() in modo "cieco", altrimenti un 400/401/500 di OpenClaw
-  diventa un 500 FastAPI del BFF (stacktrace), rendendo impossibile il debug lato FE.
-- Questo modulo espone OpenClawHTTPError con status+body per:
-  1) mostrare dettagli upstream al FE (come 502)
-  2) implementare fallback automatico (es. se input structured non è supportato)
+- Non bisogna chiamare `raise_for_status()` senza prima leggere il body.
+  Altrimenti gli errori upstream (400/401/500) diventano stacktrace 500 nel BFF.
+  Invece, qui convertiamo gli errori in una eccezione strutturata `OpenClawHTTPError`.
 """
 
 from __future__ import annotations
@@ -30,47 +26,27 @@ def _auth_headers() -> Dict[str, str]:
     return h
 
 
-def _full_url(path: str) -> str:
-    return settings.openclaw_http_base.rstrip("/") + path
-
-
-def _safe_json(resp: httpx.Response) -> Dict[str, Any]:
-    try:
-        return resp.json()
-    except Exception:
-        return {"raw": resp.text}
-
-
-def is_invalid_input_error(err_json: Dict[str, Any]) -> bool:
-    """
-    Riconosce l'errore tipico:
-      {"error":{"message":"input: Invalid input","type":"invalid_request_error"}}
-    """
-    err = err_json.get("error")
-    if not isinstance(err, dict):
-        return False
-    msg = (err.get("message") or "") if isinstance(err.get("message"), str) else ""
-    typ = (err.get("type") or "") if isinstance(err.get("type"), str) else ""
-    return ("Invalid input" in msg) and (typ in ("invalid_request_error", "invalid_request"))
-
-
 @dataclass
 class OpenClawHTTPError(Exception):
-    """
-    Errore upstream OpenClaw.
-
-    Contiene:
-    - status_code: status HTTP da OpenClaw
-    - url: URL chiamata
-    - error: body JSON (o {"raw": ...})
-    """
+    """Errore HTTP upstream da OpenClaw."""
 
     status_code: int
     url: str
-    error: Dict[str, Any]
+    error: Any
 
-    def __str__(self) -> str:
-        return f"OpenClawHTTPError(status={self.status_code}, url={self.url}, error={self.error})"
+
+def is_invalid_input_error(err: Any) -> bool:
+    """Rileva il classico errore OpenAI/OpenResponses: input invalid."""
+
+    if not isinstance(err, dict):
+        return False
+    payload = err.get("error") if "error" in err else err
+    if not isinstance(payload, dict):
+        return False
+
+    msg = str(payload.get("message") or "").lower()
+    typ = str(payload.get("type") or "").lower()
+    return ("invalid input" in msg) or ("invalid_request" in typ and "input" in msg)
 
 
 async def post_json(
@@ -79,19 +55,24 @@ async def post_json(
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 60.0,
 ) -> dict:
-    """
-    POST JSON verso OpenClaw.
+    """POST JSON verso OpenClaw.
 
-    Solleva OpenClawHTTPError se status >= 400 (con body).
+    Ritorna JSON dict.
+    Se status >= 400 solleva OpenClawHTTPError con body parseato (se possibile).
     """
-    url = _full_url(path)
+
+    url = settings.openclaw_http_base.rstrip("/") + path
     h = {**_auth_headers(), **(headers or {})}
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, json=payload, headers=h)
 
     if resp.status_code >= 400:
-        raise OpenClawHTTPError(status_code=resp.status_code, url=url, error=_safe_json(resp))
+        try:
+            err = resp.json()
+        except Exception:
+            err = {"raw": resp.text}
+        raise OpenClawHTTPError(status_code=resp.status_code, url=url, error=err)
 
     return resp.json()
 
@@ -102,12 +83,12 @@ async def stream_sse(
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 600.0,
 ) -> AsyncGenerator[bytes, None]:
-    """
-    POST che risponde con SSE. Ritorna i bytes grezzi.
+    """POST che risponde con SSE; restituisce i bytes grezzi.
 
-    Se OpenClaw risponde errore (>=400), solleva OpenClawHTTPError (con body).
+    Se OpenClaw risponde con status >= 400, solleva OpenClawHTTPError.
     """
-    url = _full_url(path)
+
+    url = settings.openclaw_http_base.rstrip("/") + path
     h = {
         **_auth_headers(),
         "Accept": "text/event-stream",
@@ -117,18 +98,15 @@ async def stream_sse(
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, json=payload, headers=h) as resp:
             if resp.status_code >= 400:
-                # Leggi tutto il body (se json) prima di alzare errore
-                body_bytes = await resp.aread()
                 try:
-                    err = httpx.Response(
-                        status_code=resp.status_code,
-                        headers=resp.headers,
-                        content=body_bytes,
-                        request=resp.request,
-                    ).json()
+                    err_bytes = await resp.aread()
+                    try:
+                        err_json = httpx.Response(200, content=err_bytes).json()
+                    except Exception:
+                        err_json = {"raw": err_bytes.decode("utf-8", errors="replace")}
                 except Exception:
-                    err = {"raw": body_bytes.decode("utf-8", errors="replace")}
-                raise OpenClawHTTPError(status_code=resp.status_code, url=url, error=err)
+                    err_json = {"raw": "<unable to read body>"}
+                raise OpenClawHTTPError(status_code=resp.status_code, url=url, error=err_json)
 
             async for chunk in resp.aiter_bytes():
                 yield chunk

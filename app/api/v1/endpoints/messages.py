@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sse_starlette.sse import EventSourceResponse
@@ -11,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.openclaw_http import OpenClawHTTPError, is_invalid_input_error, post_json, stream_sse
+from app.core.openclaw_ws import WSEvent
 from app.core.security import AuthenticatedUser, get_current_user
 from app.db.models import Conversation, Message
 from app.db.session import get_db
@@ -25,194 +26,126 @@ from app.schemas.messages import (
     SendMessageResponse,
     StreamMessageRequest,
 )
-from app.utils.openresponses import extract_output_text
-from app.utils.sse import iter_sse_events
 
 router = APIRouter(prefix="/conversations/{conversation_id}")
 
 
 # =============================================================================
-# Payload builders (structured vs simple)
+# OpenClaw WS Agent Loop bridge
 # =============================================================================
 
-def _build_openresponses_payload_structured(
-    text: str,
-    attachments: Optional[list[dict]] = None,
-    model: Optional[str] = None,
-    stream: bool = False,
-) -> Dict[str, Any]:
+
+def _agent_id(conv: Conversation) -> str:
+    return conv.agent_id or settings.openclaw_default_agent_id
+
+
+def _extract_text_delta(ev: WSEvent) -> str:
+    """Best-effort: estrae delta testuale dagli eventi agent.
+
+    Shape dipende dalla build. Pattern gestiti:
+    - payload.stream in ['assistant','text','reasoning']
+    - payload.data contiene 'delta' o 'text'
     """
-    Payload "OpenAI Responses-like" (structured).
-    ATTENZIONE: la tua build OpenClaw attuale risponde 400 "input: Invalid input" su questo formato.
-    Lo teniamo per:
-      - futuro supporto
-      - fallback/compat con build diverse
-    """
-    content: List[Dict[str, Any]] = [{"type": "input_text", "text": text}]
 
-    for att in attachments or []:
-        att_type = att.get("type")
-        url = att.get("url")
-        if not att_type or not url:
-            continue
-        if att_type == "input_image":
-            content.append({"type": "input_image", "image_url": url})
-        elif att_type == "input_file":
-            content.append({"type": "input_file", "file_url": url})
-        else:
-            content.append({"type": att_type, "url": url})
-
-    payload: Dict[str, Any] = {
-        "model": model or f"openclaw:{settings.openclaw_default_agent_id}",
-        "input": [{"role": "user", "content": content}],
-        "stream": bool(stream),
-    }
-    return payload
+    p = ev.payload
+    stream = str(p.get("stream") or "")
+    if stream not in {"assistant", "text", "reasoning"}:
+        return ""
+    data = p.get("data") or {}
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("delta") or data.get("text") or "")
 
 
-def _build_openresponses_payload_simple(
-    text: str,
-    attachments: Optional[list[dict]] = None,
-    stream: bool = False,
-) -> Dict[str, Any]:
-    """
-    Payload "simple" compatibile con build OpenClaw che NON supportano input structured.
-    Qui usiamo:
-      - model: "openclaw"
-      - input: string
-    """
-    extra_lines: List[str] = []
-    for att in attachments or []:
-        att_type = att.get("type")
-        url = att.get("url")
-        if not att_type or not url:
-            continue
-        extra_lines.append(f"[attachment:{att_type}] {url}")
-
-    joined = text
-    if extra_lines:
-        joined = text + "\n\n" + "\n".join(extra_lines)
-
-    return {
-        "model": "openclaw",
-        "input": joined,
-        "stream": bool(stream),
+def _is_lifecycle_done(ev: WSEvent) -> bool:
+    p = ev.payload
+    if str(p.get("stream") or "") != "lifecycle":
+        return False
+    data = p.get("data")
+    if not isinstance(data, dict):
+        return False
+    phase = str(data.get("phase") or data.get("status") or "").lower()
+    typ = str(data.get("type") or "").lower()
+    return phase in {"done", "completed", "complete", "end", "finished"} or typ in {
+        "completed",
+        "done",
+        "run.completed",
+        "agent.completed",
     }
 
 
-def _openclaw_headers_for_conversation(conv: Conversation) -> Dict[str, str]:
-    """
-    Header OpenClaw per:
-      - session key (se presente) per continuare lo stesso thread lato gateway
-      - agent id (sempre) per selezionare l'agente
-    """
-    agent_id = conv.agent_id or settings.openclaw_default_agent_id
-    h: Dict[str, str] = {
-        "x-openclaw-agent-id": agent_id,
-    }
-    if conv.openclaw_session_key:
-        h["x-openclaw-session-key"] = conv.openclaw_session_key
-    return h
+def _tool_event_payload(ev: WSEvent) -> Optional[dict]:
+    p = ev.payload
+    if str(p.get("stream") or "") != "tool":
+        return None
+    data = p.get("data")
+    if isinstance(data, dict):
+        return data
+    return {"raw": data}
 
 
-async def _call_openclaw_responses_with_fallback(
-    conv: Conversation,
-    text: str,
-    attachments: Optional[list[dict]],
-    stream: bool,
-) -> Tuple[dict, str]:
-    """
-    Chiama OpenClaw /v1/responses provando:
-      A) structured (openclaw:<agent>)  -> se 400 invalid input => fallback
-      B) simple (model=openclaw,input=string)
+async def _run_agent_and_collect(
+    ws,
+    *,
+    agent_id: str,
+    session_key: Optional[str],
+    message: str,
+    timeout_s: float = 120.0,
+) -> tuple[str, list[dict], str]:
+    """Esegue un turn agentico via WS e raccoglie testo + eventi tool."""
 
-    Ritorna:
-      (response_json, mode_used) dove mode_used in {"structured","simple"}.
+    params: Dict[str, Any] = {"agentId": agent_id, "message": message}
+    if session_key:
+        params["sessionKey"] = session_key
 
-    Se fallisce anche fallback, solleva HTTPException 502 con dettaglio upstream.
-    """
-    headers = _openclaw_headers_for_conversation(conv)
+    run = await ws.call("agent", params)
+    if not isinstance(run, dict):
+        raise RuntimeError(f"Unexpected agent() response: {run!r}")
+    run_id = str(run.get("runId") or run.get("id") or "")
+    if not run_id:
+        raise RuntimeError(f"agent() did not return runId: {run!r}")
 
-    # Candidate A: structured (con model openclaw:<agent>)
-    payload_a = _build_openresponses_payload_structured(
-        text,
-        attachments=attachments,
-        model=f"openclaw:{conv.agent_id or settings.openclaw_default_agent_id}",
-        stream=stream,
-    )
+    assistant_accum = ""
+    tool_events: list[dict] = []
 
+    wait_task: Optional[asyncio.Task] = None
     try:
-        resp = await post_json("/v1/responses", payload_a, headers=headers)
-        return resp, "structured"
-    except OpenClawHTTPError as e:
-        # Se è "invalid input", facciamo fallback al semplice.
-        if e.status_code == 400 and is_invalid_input_error(e.error):
-            payload_b = _build_openresponses_payload_simple(text, attachments=attachments, stream=stream)
-            try:
-                resp = await post_json("/v1/responses", payload_b, headers=headers)
-                return resp, "simple"
-            except OpenClawHTTPError as e2:
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "upstream": "openclaw",
-                        "where": "responses.simple",
-                        "status": e2.status_code,
-                        "url": e2.url,
-                        "error": e2.error,
-                    },
-                )
-        # Altri errori: propaga come 502 con dettaglio
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "upstream": "openclaw",
-                "where": "responses.structured",
-                "status": e.status_code,
-                "url": e.url,
-                "error": e.error,
-            },
+        wait_task = asyncio.create_task(
+            ws.call("agent.wait", {"runId": run_id, "timeoutMs": int(timeout_s * 1000)})
         )
+    except Exception:
+        wait_task = None
 
+    async for ev in ws.subscribe("agent", run_id=run_id):
+        d = _extract_text_delta(ev)
+        if d:
+            assistant_accum += d
 
-async def _stream_openclaw_responses_with_fallback(
-    conv: Conversation,
-    text: str,
-    attachments: Optional[list[dict]],
-) -> AsyncGenerator[bytes, None]:
-    """
-    Streaming SSE con fallback:
-      A) structured stream:true -> se 400 invalid input => B) simple stream:true
+        te = _tool_event_payload(ev)
+        if te is not None:
+            tool_events.append(te)
 
-    Ritorna generator di bytes SSE.
-    """
-    headers = _openclaw_headers_for_conversation(conv)
+        if _is_lifecycle_done(ev):
+            break
 
-    payload_a = _build_openresponses_payload_structured(
-        text,
-        attachments=attachments,
-        model=f"openclaw:{conv.agent_id or settings.openclaw_default_agent_id}",
-        stream=True,
-    )
+        if wait_task and wait_task.done():
+            break
 
-    try:
-        async for b in stream_sse("/v1/responses", payload_a, headers=headers):
-            yield b
-        return
-    except OpenClawHTTPError as e:
-        if e.status_code == 400 and is_invalid_input_error(e.error):
-            payload_b = _build_openresponses_payload_simple(text, attachments=attachments, stream=True)
-            async for b in stream_sse("/v1/responses", payload_b, headers=headers):
-                yield b
-            return
+    if wait_task:
+        try:
+            await asyncio.wait_for(wait_task, timeout=1.0)
+        except Exception:
+            pass
 
-        # altri errori: rilancia e lo gestiremo a livello superiore
-        raise
+    return assistant_accum, tool_events, run_id
 
 
 # =============================================================================
 # DB helpers
 # =============================================================================
+
 
 async def _get_conversation_or_404(db: AsyncSession, user_id: str, conversation_id: uuid.UUID) -> Conversation:
     conv = (
@@ -233,6 +166,7 @@ async def _get_conversation_or_404(db: AsyncSession, user_id: str, conversation_
 # Endpoints
 # =============================================================================
 
+
 @router.get(
     "/messages",
     summary="Elenca messaggi della conversazione",
@@ -252,6 +186,7 @@ async def list_messages(
 
     Nota: per UI stabile è preferibile source=db.
     """
+
     conv = await _get_conversation_or_404(db, user.user_id, conversation_id)
 
     if source == "gateway":
@@ -280,7 +215,12 @@ async def list_messages(
         return msgs
 
     # default DB
-    stmt = select(Message).where(Message.conversation_id == conv.id).order_by(Message.created_at.asc()).limit(limit)
+    stmt = (
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+    )
     rows = (await db.execute(stmt)).scalars().all()
     return [
         MessageItem(
@@ -307,7 +247,13 @@ async def send_message(
     user: AuthenticatedUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> SendMessageResponse:
-    """Invia un messaggio utente e ritorna la risposta finale (no stream)."""
+    """Invia un messaggio utente e ritorna la risposta finale (no stream).
+
+    Differenza chiave rispetto al vecchio comportamento:
+    - NON chiama più /v1/responses HTTP
+    - usa WS Agent Loop (`agent` + stream `event: agent`) così possiamo catturare tool events.
+    """
+
     conv = await _get_conversation_or_404(db, user.user_id, conversation_id)
 
     # Persist user message
@@ -321,15 +267,17 @@ async def send_message(
     )
     await db.commit()
 
-    # Call OpenClaw with fallback (structured -> simple)
-    resp, mode_used = await _call_openclaw_responses_with_fallback(
-        conv,
-        body.content,
-        attachments=[a.model_dump() for a in (body.attachments or [])],
-        stream=False,
-    )
+    from app.main import get_ws_client
 
-    assistant_text = extract_output_text(resp)
+    ws = get_ws_client()
+    await ws.connect()
+
+    assistant_text, tool_events, run_id = await _run_agent_and_collect(
+        ws,
+        agent_id=_agent_id(conv),
+        session_key=conv.openclaw_session_key,
+        message=body.content,
+    )
 
     # Persist assistant
     db.add(
@@ -337,18 +285,32 @@ async def send_message(
             conversation_id=conv.id,
             role="assistant",
             content=assistant_text,
-            raw={"openclaw": resp, "mode_used": mode_used},
+            raw={"run_id": run_id, "tool_events": tool_events},
         )
     )
     await db.commit()
 
-    return SendMessageResponse(conversation_id=conv.id, assistant_text=assistant_text, openclaw_response=resp)
+    # openclaw_response: best-effort structure (non è più la risposta OpenResponses HTTP)
+    openclaw_response = {
+        "object": "agent.run",
+        "run_id": run_id,
+        "agent_id": _agent_id(conv),
+        "session_key": conv.openclaw_session_key,
+        "output_text": assistant_text,
+        "tool_events": tool_events,
+    }
+
+    return SendMessageResponse(
+        conversation_id=conv.id,
+        assistant_text=assistant_text,
+        openclaw_response=openclaw_response,
+    )
 
 
 @router.post(
     "/messages/stream",
     summary="Invia un messaggio (stream SSE)",
-    description="Proxy SSE verso OpenClaw /v1/responses (stream:true) con fallback payload.",
+    description="Bridge WS Agent Loop -> SSE (include tool events).",
 )
 async def send_message_stream(
     conversation_id: uuid.UUID,
@@ -358,11 +320,13 @@ async def send_message_stream(
 ):
     """Streaming SSE.
 
+    Il backend:
     - salva il messaggio utente in DB
-    - chiama OpenClaw `/v1/responses` con `stream:true` (fallback se input structured non supportato)
-    - proxy SSE verso FE
-    - salva il testo finale assistente in DB (se persist_streamed_messages)
+    - invoca WS `agent`
+    - ascolta eventi `event: agent` filtrati per runId
+    - re-emette SSE verso FE includendo tool events
     """
+
     conv = await _get_conversation_or_404(db, user.user_id, conversation_id)
 
     # Persist user message
@@ -377,43 +341,71 @@ async def send_message_stream(
     await db.commit()
 
     async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
+        from app.main import get_ws_client
+
+        ws = get_ws_client()
         assistant_accum = ""
+        tool_events: list[dict] = []
+
         try:
-            byte_stream = _stream_openclaw_responses_with_fallback(
-                conv,
-                body.content,
-                attachments=[a.model_dump() for a in (body.attachments or [])],
-            )
+            await ws.connect()
 
-            async for ev in iter_sse_events(byte_stream):
-                # forward original event for debugging
-                yield {"event": f"openclaw.{ev.event}", "data": ev.data}
-
-                # translate known events into deltas
-                # Nota: i nomi event possono variare; qui gestiamo pattern comuni
-                if ev.event.endswith("output_text.delta") or ev.event.endswith("response.output_text.delta"):
-                    try:
-                        j = json.loads(ev.data)
-                        delta = j.get("delta") or j.get("text") or ""
-                    except Exception:
-                        delta = ""
-                    if delta:
-                        assistant_accum += delta
-                        yield {"event": "message.delta", "data": json.dumps({"delta": delta})}
-
-                if ev.event.endswith("completed") or ev.event.endswith("response.completed"):
-                    yield {"event": "message.completed", "data": json.dumps({"text": assistant_accum})}
-
-        except OpenClawHTTPError as e:
-            # errore upstream dettagliato
-            yield {
-                "event": "error",
-                "data": json.dumps(
-                    {"upstream": "openclaw", "status": e.status_code, "url": e.url, "error": e.error}
-                ),
+            params: Dict[str, Any] = {
+                "agentId": _agent_id(conv),
+                "message": body.content,
+                "idempotencyKey": uuid.uuid4().hex,
             }
+            if conv.openclaw_session_key:
+                params["sessionKey"] = conv.openclaw_session_key
+
+            run = await ws.call("agent", params)
+            run_id = str(run.get("runId") or run.get("id") or "") if isinstance(run, dict) else ""
+            if not run_id:
+                raise RuntimeError(f"agent() did not return runId: {run!r}")
+
+            # wait in background (best-effort)
+            wait_task: Optional[asyncio.Task] = None
+            try:
+                wait_task = asyncio.create_task(
+                    ws.call("agent.wait", {"runId": run_id, "timeoutMs": 10 * 60 * 1000})
+                )
+            except Exception:
+                wait_task = None
+
+            async for ev in ws.subscribe("agent", run_id=run_id):
+                # 1) evento raw (debug)
+                yield {"event": "openclaw.agent", "data": json.dumps(ev.payload)}
+
+                # 2) tool events
+                te = _tool_event_payload(ev)
+                if te is not None:
+                    tool_events.append(te)
+                    yield {"event": "tool.event", "data": json.dumps({"run_id": run_id, **te})}
+
+                # 3) text delta
+                delta = _extract_text_delta(ev)
+                if delta:
+                    assistant_accum += delta
+                    yield {"event": "message.delta", "data": json.dumps({"delta": delta})}
+
+                if _is_lifecycle_done(ev):
+                    break
+
+                if wait_task and wait_task.done():
+                    break
+
+            # ensure wait task done (ignore errors)
+            if wait_task:
+                try:
+                    await asyncio.wait_for(wait_task, timeout=1.0)
+                except Exception:
+                    pass
+
+            yield {"event": "message.completed", "data": json.dumps({"text": assistant_accum})}
+
         except Exception as e:  # noqa: BLE001
             yield {"event": "error", "data": json.dumps({"message": str(e)})}
+
         finally:
             if settings.persist_streamed_messages and assistant_accum:
                 db.add(
@@ -421,7 +413,7 @@ async def send_message_stream(
                         conversation_id=conv.id,
                         role="assistant",
                         content=assistant_accum,
-                        raw={"streamed": True},
+                        raw={"streamed": True, "tool_events": tool_events},
                     )
                 )
                 await db.commit()
@@ -446,6 +438,7 @@ async def abort_run(
 
     ws = get_ws_client()
     await ws.connect()
+
     params: Dict[str, Any] = {"sessionKey": conv.openclaw_session_key}
     if body.run_id:
         params["runId"] = body.run_id
