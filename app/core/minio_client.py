@@ -5,6 +5,7 @@ Obiettivo: permettere al FE di caricare file direttamente su MinIO tramite presi
 
 from __future__ import annotations
 
+import io
 from datetime import timedelta
 
 from minio import Minio
@@ -57,3 +58,38 @@ def public_object_url(bucket: str, object_key: str) -> str:
     # Fallback: endpoint diretto (potrebbe non essere raggiungibile dal FE se in rete diversa)
     scheme = "https" if settings.minio_secure else "http"
     return f"{scheme}://{settings.minio_endpoint}/{bucket}/{object_key}"
+
+
+def put_bytes(
+    client: Minio,
+    bucket: str,
+    object_key: str,
+    data: bytes,
+    *,
+    content_type: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> None:
+    """Upload di bytes direttamente a MinIO."""
+
+    bio = io.BytesIO(data)
+    client.put_object(
+        bucket,
+        object_key,
+        bio,
+        length=len(data),
+        content_type=content_type,
+        metadata=metadata,
+    )
+
+
+def get_object_stream(client: Minio, bucket: str, object_key: str):
+    """Ritorna lo stream dell'oggetto (response-like con .read/.close)."""
+    return client.get_object(bucket, object_key)
+
+
+def stat_object(client: Minio, bucket: str, object_key: str):
+    return client.stat_object(bucket, object_key)
+
+
+def remove_object(client: Minio, bucket: str, object_key: str) -> None:
+    client.remove_object(bucket, object_key)

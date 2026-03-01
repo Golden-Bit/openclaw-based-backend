@@ -66,5 +66,10 @@ class Settings(BaseSettings):
     allow_raw_openclaw_session_key: bool = Field(default=False, alias="ALLOW_RAW_OPENCLAW_SESSION_KEY")
     persist_streamed_messages: bool = Field(default=True, alias="PERSIST_STREAMED_MESSAGES")
 
+    # Uploads
+    upload_max_bytes: int = Field(default=10_000_000, alias="UPLOAD_MAX_BYTES")  # 10MB
+    upload_presign_put_expires_seconds: int = Field(default=900, alias="UPLOAD_PRESIGN_PUT_EXPIRES_SECONDS")
+    upload_presign_get_expires_seconds: int = Field(default=3600, alias="UPLOAD_PRESIGN_GET_EXPIRES_SECONDS")
+
 
 settings = Settings()  # singleton

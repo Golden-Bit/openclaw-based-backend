@@ -79,9 +79,19 @@ class Upload(Base):
     mime_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(nullable=True)
 
+    # Metadati applicativi (ricercabili lato DB).
+    # Nota: i metadata *S3* non sono aggiornabili in-place: per questo li teniamo in DB.
+    metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tags: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     status: Mapped[str] = mapped_column(String(50), default="created")  # created|uploaded|failed
 
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ConversationAlias(Base):
