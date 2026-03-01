@@ -11,13 +11,31 @@ Handshake (schema strict, basato su quello che la tua build richiede):
 2) client -> req: connect { minProtocol/maxProtocol/client/role/scopes/... + device(signature) }
 3) server -> res: hello-ok payload
 
-PROBLEMA risolto qui:
+PROBLEMI risolti qui:
 - "device signature invalid" / problemi identity:
-  ora riusiamo la device identity del CLI via OPENCLAW_IDENTITY_FILE.
-  Nel tuo caso il file contiene *PEM*:
+  riusiamo la device identity del CLI via OPENCLAW_IDENTITY_FILE.
+  Nel tuo caso il file contiene PEM:
     - publicKeyPem
     - privateKeyPem
   Quindi parsifichiamo PEM con cryptography e ricaviamo raw key (32 bytes).
+
+DEBUG (per vedere TUTTI gli eventi e capire dove arrivano i tool):
+- OPENCLAW_WS_DEBUG=1
+    stampa meta-eventi (event name, runId, keys)
+- OPENCLAW_WS_DEBUG_PAYLOAD=1
+    stampa payload completo (pretty JSON) per gli eventi filtrati
+- OPENCLAW_WS_DEBUG_EVENTS="chat,agent,health,tick"
+    quali event names stampare in payload completo (default: "chat")
+- OPENCLAW_WS_DEBUG_RUNID="<runId>"
+    se settato, stampa SOLO eventi con quel runId
+- OPENCLAW_WS_DEBUG_MAX_CHARS="20000"
+    tronca stampa payload oltre N caratteri (default: 20000)
+
+IMPORTANTISSIMO per il tuo caso "tools non visibili":
+- spesso i tool NON arrivano come agent.stream="tool",
+  ma si possono annidare dentro event "chat" (state/message) oppure come altri event types.
+  Con OPENCLAW_WS_DEBUG_PAYLOAD=1 + OPENCLAW_WS_DEBUG_EVENTS=chat,agent
+  vedrai finalmente la shape reale dei payload.
 
 ENV supportate (importanti):
 - OPENCLAW_WS_URL
@@ -28,6 +46,7 @@ ENV supportate (importanti):
 - OPENCLAW_SCOPES (comma-separated)
 - OPENCLAW_IDENTITY_FILE (prioritaria; es: ~/.openclaw/identity/device.json)
 - OPENCLAW_STATE_DIR (fallback: identity generata dal BFF, sconsigliata nel tuo setup)
+- OPENCLAW_WS_CONNECT_TIMEOUT / OPENCLAW_WS_RPC_TIMEOUT
 
 Nota websockets:
 - websockets >= 15/16 usa additional_headers (NON extra_headers).
@@ -76,6 +95,57 @@ class WSHello:
 class WSEvent:
     event: str
     payload: dict
+
+
+# =============================================================================
+# Debug helpers (ENV-driven)
+# =============================================================================
+
+def _dbg_enabled() -> bool:
+    return os.getenv("OPENCLAW_WS_DEBUG", "").strip() == "1"
+
+
+def _dbg_payload_enabled() -> bool:
+    return os.getenv("OPENCLAW_WS_DEBUG_PAYLOAD", "").strip() == "1"
+
+
+def _dbg_events_filter() -> set[str]:
+    """
+    OPENCLAW_WS_DEBUG_EVENTS="chat,agent,health,tick"
+    default: {"chat"} (stampiamo SEMPRE chat se debug payload è attivo e non hai specificato altro)
+    """
+    raw = os.getenv("OPENCLAW_WS_DEBUG_EVENTS", "").strip()
+    if not raw:
+        return {"chat"}
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def _dbg_runid_filter() -> str:
+    """
+    Se settato, stampa SOLO eventi con quel runId.
+    Esempio:
+      export OPENCLAW_WS_DEBUG_RUNID=49c43345e7a449bcae4f92f0810c36e1
+    """
+    return os.getenv("OPENCLAW_WS_DEBUG_RUNID", "").strip()
+
+
+def _dbg_max_chars() -> int:
+    try:
+        return int(os.getenv("OPENCLAW_WS_DEBUG_MAX_CHARS", "20000").strip())
+    except Exception:
+        return 20000
+
+
+def _dbg_print(label: str, obj: Any) -> None:
+    # stampa JSON “pretty” senza escape unicode, con truncation
+    try:
+        s = json.dumps(obj, indent=2, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    maxc = _dbg_max_chars()
+    if maxc > 0 and len(s) > maxc:
+        s = s[:maxc] + f"\n... [TRUNCATED {len(s) - maxc} chars]"
+    print(f"[openclaw_ws DEBUG] {label}\n{s}", flush=True)
 
 
 # =============================================================================
@@ -352,7 +422,7 @@ class OpenClawWSClient:
         self.hello: Optional[WSHello] = None
         self._lock = asyncio.Lock()
 
-        # subscriptions
+        # subscriptions: (event_name, run_id_filter, queue)
         self._subs: List[Tuple[str, Optional[str], asyncio.Queue]] = []
 
         # timeouts
@@ -396,6 +466,17 @@ class OpenClawWSClient:
         self._pub_raw = pub_raw
         self._priv_raw = priv_raw
 
+        if _dbg_enabled():
+            _dbg_print(
+                "IDENTITY loaded",
+                {
+                    "identity_file": str(self._identity_file),
+                    "device_id": self._device_id,
+                    "pub_len": len(self._pub_raw),
+                    "priv_len": len(self._priv_raw),
+                },
+            )
+
     def _build_device_signature(
         self,
         *,
@@ -437,13 +518,32 @@ class OpenClawWSClient:
         priv = Ed25519PrivateKey.from_private_bytes(self._priv_raw)
         sig = priv.sign(payload)
 
-        return {
+        signed = {
             "id": self._device_id,
             "publicKey": _b64url_encode(self._pub_raw),
             "signature": _b64url_encode(sig),
             "signedAt": ts_ms,
             "nonce": nonce,
         }
+
+        if _dbg_enabled():
+            _dbg_print(
+                "DEVICE signature built",
+                {
+                    "device_id": self._device_id,
+                    "client_id": client_id,
+                    "client_mode": client_mode,
+                    "role": role,
+                    "scopes": scopes,
+                    "signedAt": ts_ms,
+                    "nonce": nonce,
+                    "token_present": bool(token),
+                    "signature_len": len(signed["signature"]),
+                    "publicKey_len": len(signed["publicKey"]),
+                },
+            )
+
+        return signed
 
     # -------------------------------------------------------------------------
     # Handshake / connect
@@ -468,6 +568,22 @@ class OpenClawWSClient:
             additional_headers: Optional[List[Tuple[str, str]]] = None
             if token:
                 additional_headers = [("Authorization", f"Bearer {token}")]
+
+            if _dbg_enabled():
+                _dbg_print(
+                    "CONNECT begin",
+                    {
+                        "url": self.url,
+                        "token_present": bool(token),
+                        "client_id": _get_client_id(),
+                        "client_mode": _get_client_mode(),
+                        "role": _get_role(),
+                        "scopes": _get_scopes(),
+                        "identity_file": self._identity_file,
+                        "connect_timeout": self._connect_timeout,
+                        "rpc_timeout": self._rpc_timeout,
+                    },
+                )
 
             try:
                 self._ws = await websockets.connect(
@@ -523,6 +639,9 @@ class OpenClawWSClient:
                     "device": device,
                 }
 
+                if _dbg_payload_enabled() and ("connect" in _dbg_events_filter()):
+                    _dbg_print("CONNECT params", connect_params)
+
                 hello_payload = await self._rpc_handshake("connect", connect_params, timeout=self._connect_timeout)
 
                 if not isinstance(hello_payload, dict):
@@ -534,6 +653,16 @@ class OpenClawWSClient:
                     policy=hello_payload.get("policy", {}) or {},
                     raw=hello_payload,
                 )
+
+                if _dbg_enabled():
+                    _dbg_print(
+                        "CONNECT hello",
+                        {
+                            "protocol": self.hello.protocol,
+                            "features_keys": list((self.hello.features or {}).keys()),
+                            "policy_keys": list((self.hello.policy or {}).keys()),
+                        },
+                    )
 
                 # Start listener AFTER handshake
                 self._listener_task = asyncio.create_task(self._listener())
@@ -555,6 +684,10 @@ class OpenClawWSClient:
         payload = data.get("payload") or {}
         if not isinstance(payload, dict):
             raise RuntimeError("connect.challenge payload is not an object")
+
+        if _dbg_payload_enabled() and ("connect.challenge" in _dbg_events_filter()):
+            _dbg_print("PAYLOAD(connect.challenge)", payload)
+
         return payload
 
     async def _rpc_handshake(self, method: str, params: dict, timeout: float) -> Any:
@@ -596,6 +729,9 @@ class OpenClawWSClient:
         fut = loop.create_future()
         self._pending[req_id] = fut
 
+        if _dbg_payload_enabled() and ("rpc.req" in _dbg_events_filter()):
+            _dbg_print(f"RPC REQ {method}", frame)
+
         await self._ws.send(json.dumps(frame))
         return await asyncio.wait_for(fut, timeout=timeout or self._rpc_timeout)
 
@@ -607,9 +743,10 @@ class OpenClawWSClient:
         """
         Sottoscrive eventi gateway:
         - event_name: es. "agent", "chat", ecc.
+        - event_name="*" prende QUALSIASI evento (utile per debug)
         - run_id: se fornito, filtra payload.runId == run_id
         """
-        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        q: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._subs.append((event_name, run_id, q))
         try:
             while True:
@@ -623,6 +760,7 @@ class OpenClawWSClient:
         Listener principale:
         - risolve futures per i res
         - inoltra eventi ai subscriber
+        - DEBUG: stampa meta e/o payload completo in base alle env
         """
         assert self._ws is not None
         try:
@@ -641,26 +779,52 @@ class OpenClawWSClient:
 
                 elif t == "event":
                     ev = str(data.get("event") or "")
-                    payload = data.get("payload") if isinstance(data.get("payload"), dict) else (data.get("payload") or {})
-                    if not isinstance(payload, dict):
-                        payload = {"raw": payload}
 
-                    run_id = str(payload.get("runId") or payload.get("run_id") or "")
+                    raw_payload = data.get("payload")
+                    if isinstance(raw_payload, dict):
+                        payload_dict: dict = raw_payload
+                    else:
+                        payload_dict = {"raw": raw_payload}
 
-                    ws_event = WSEvent(event=ev, payload=payload)
+                    # runId best-effort (per filtrare debug)
+                    run_id = str(payload_dict.get("runId") or payload_dict.get("run_id") or "")
 
+                    # ---------------------------
+                    # DEBUG PRINT (FULL PAYLOAD)
+                    # ---------------------------
+                    if _dbg_enabled() or _dbg_payload_enabled():
+                        run_filter = _dbg_runid_filter()
+                        events_filter = _dbg_events_filter()
+
+                        if (not run_filter) or (run_id == run_filter):
+                            # meta
+                            if _dbg_enabled():
+                                stream_name = payload_dict.get("stream")
+                                print(
+                                    f"[openclaw_ws DEBUG] EVENT meta: event={ev} stream={stream_name} runId={run_id} keys={list(payload_dict.keys())}",
+                                    flush=True,
+                                )
+
+                            # payload completo
+                            if _dbg_payload_enabled() and (ev in events_filter):
+                                _dbg_print(f"PAYLOAD({ev}) runId={run_id}", payload_dict)
+
+                    ws_event = WSEvent(event=ev, payload=payload_dict)
+
+                    # broadcast ai subscriber
                     for wanted_ev, wanted_run, q in list(self._subs):
-                        if wanted_ev != ev:
+                        if wanted_ev != "*" and wanted_ev != ev:
                             continue
                         if wanted_run and wanted_run != run_id:
                             continue
                         try:
                             q.put_nowait(ws_event)
                         except asyncio.QueueFull:
+                            # se consumer lento, droppiamo (evita blocco listener)
                             pass
 
-
                 else:
+                    # ignore unknown frames
                     pass
 
         except Exception:
