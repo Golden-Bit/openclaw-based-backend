@@ -85,7 +85,8 @@ def _to_out(
         mime_type=rec.mime_type,
         size_bytes=rec.size_bytes,
         sha256=rec.sha256,
-        metadata=rec.metadata,
+        # IMPORTANTISSIMO: ORM attribute è metadata_ (metadata è riservato in SQLAlchemy)
+        metadata=rec.metadata_,
         tags=rec.tags,
         status=rec.status,
         is_deleted=rec.is_deleted,
@@ -230,7 +231,7 @@ async def upload_file_multipart(
         mime_type=mime_type,
         size_bytes=len(data),
         sha256=sha,
-        metadata=metadata,
+        metadata_=metadata,  # <-- FIX
         tags=tag_list,
         status="uploaded",
         is_deleted=False,
@@ -290,7 +291,7 @@ async def upload_file_bytes(
         mime_type=mime_type,
         size_bytes=len(body),
         sha256=sha,
-        metadata=metadata,
+        metadata_=metadata,  # <-- FIX
         tags=tag_list,
         status="uploaded",
         is_deleted=False,
@@ -353,7 +354,7 @@ async def upload_file_base64(
         mime_type=body.mime_type,
         size_bytes=len(raw),
         sha256=sha,
-        metadata=body.metadata,
+        metadata_=body.metadata,  # <-- FIX
         tags=body.tags,
         status="uploaded",
         is_deleted=False,
@@ -406,7 +407,7 @@ async def create_upload_presign(
         filename=_sanitize_filename(body.filename),
         mime_type=body.mime_type,
         size_bytes=body.size_bytes,
-        metadata=body.metadata,
+        metadata_=body.metadata,  # <-- FIX
         tags=body.tags,
         status="created",
         is_deleted=False,
@@ -462,7 +463,7 @@ async def list_uploads(
     if tag:
         where.append(Upload.tags.contains([tag]))
     if meta_filter:
-        where.append(Upload.metadata.op("@>")(meta_filter))
+        where.append(Upload.metadata_.op("@>")(meta_filter))  # <-- FIX
 
     total_stmt = select(func.count()).select_from(select(Upload.id).where(*where).subquery())
     total_res = await db.execute(total_stmt)
@@ -587,7 +588,7 @@ async def update_upload_metadata(
     if body.mime_type is not None:
         rec.mime_type = body.mime_type
     if body.metadata is not None:
-        rec.metadata = body.metadata
+        rec.metadata_ = body.metadata  # <-- FIX
     if body.tags is not None:
         rec.tags = body.tags
     if body.status is not None:
