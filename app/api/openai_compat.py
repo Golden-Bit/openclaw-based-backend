@@ -1,400 +1,508 @@
 from __future__ import annotations
 
-"""OpenAI-compatible endpoints (proxy) for OpenClaw Gateway.
-
-Questo router espone:
-- /v1/responses (OpenAI Responses-like)
-- /v1/chat/completions (OpenAI ChatCompletions-like)
-- /v1/models
-
-Modifica chiave (per la tua build OpenClaw):
-- L'upstream OpenClaw *non* accetta l'input "structured" (array di messages + content blocks)
-  con `model: openclaw:<agent>`; risponde 400 "input: Invalid input".
-- Quindi qui normalizziamo sempre la richiesta verso l'upstream in modalità "simple":
-
-    POST /v1/responses
-      payload -> {"model":"openclaw", "input":"<prompt string>", "stream": true|false}
-      headers -> x-openclaw-agent-id, x-openclaw-session-key (se presenti)
-
-Note:
-- La selezione del *modello reale* (OpenAI/Anthropic/...) NON avviene via `model` in questa API.
-  Avviene dentro OpenClaw per l'agent selezionato (x-openclaw-agent-id).
-"""
-
 import json
 import time
 import uuid
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from starlette.responses import JSONResponse, StreamingResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.openclaw_http import OpenClawHTTPError, post_json, stream_sse
+from app.core.openclaw_http import post_json, stream_sse
 from app.core.security import AuthenticatedUser, get_current_user
+from app.db.models import Conversation
 from app.db.session import get_db
 from app.utils.openresponses import extract_output_text
-from app.utils.sse import format_sse, iter_sse_events
+from app.utils.sse import iter_sse_events
 
-router = APIRouter(tags=["openai"])
+router = APIRouter()
 
 
 # =============================================================================
-# Helpers: conversation + agent/session
+# DB helpers
 # =============================================================================
 
-
-def _safe_uuid(s: str) -> Optional[uuid.UUID]:
+async def _get_conversation_by_id(db: AsyncSession, user_id: str, conversation_id: str) -> Conversation:
     try:
-        return uuid.UUID(s)
+        cid = uuid.UUID(conversation_id)
     except Exception:
-        return None
+        raise HTTPException(status_code=400, detail="Invalid x-bff-conversation-id")
 
-
-async def _get_conversation_or_none(db, user_id: str, conversation_id: Optional[uuid.UUID]):
-    if not conversation_id:
-        return None
-    # Import locale per evitare cicli
-    from sqlalchemy import select
-    from app.db.models import Conversation
-
-    return (
+    conv = (
         await db.execute(
             select(Conversation).where(
-                Conversation.id == conversation_id,
+                Conversation.id == cid,
                 Conversation.user_id == user_id,
                 Conversation.is_deleted.is_(False),
             )
         )
     ).scalars().first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conv
 
+
+async def _get_or_create_conversation_by_alias(db: AsyncSession, user_id: str, alias: str) -> Conversation:
+    conv = (
+        await db.execute(
+            select(Conversation).where(
+                Conversation.user_id == user_id,
+                Conversation.alias == alias,
+                Conversation.is_deleted.is_(False),
+            )
+        )
+    ).scalars().first()
+    if conv:
+        return conv
+
+    conv = Conversation(user_id=user_id, alias=alias, agent_id=settings.openclaw_default_agent_id)
+    conv.openclaw_session_key = f"bff:{uuid.uuid4()}"
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+    return conv
+
+
+# =============================================================================
+# Helpers: infer agent/session from request
+# =============================================================================
 
 def _infer_agent_from_payload(payload: dict) -> Optional[str]:
-    """Se il client passa model='openclaw:<agent>', estraiamo <agent>."""
-
-    model = payload.get("model")
-    if isinstance(model, str) and model.startswith("openclaw:"):
+    """
+    Interpreta `model` per selezionare agentId:
+    - "openclaw:<agent>"  -> agent = <agent>
+    - "openclaw"          -> None (usa default agent della conversazione)
+    - altro               -> None (NON lo trattiamo come agentId)
+    """
+    model = str(payload.get("model") or "").strip()
+    if model.startswith("openclaw:"):
         return model.split(":", 1)[1].strip() or None
     return None
 
 
-def _resolve_agent_id(
-    *,
-    payload: dict,
-    header_agent: Optional[str],
-    conv_agent: Optional[str],
-) -> str:
-    # precedenza: header > model openclaw:<agent> > conversation > default
-    if header_agent:
-        return header_agent
-    inferred = _infer_agent_from_payload(payload)
-    if inferred:
-        return inferred
-    if conv_agent:
-        return conv_agent
-    return settings.openclaw_default_agent_id
+def _infer_alias_from_payload(payload: dict) -> str:
+    """
+    Alias conversazione (best-effort):
+    - payload.user
+    - payload.metadata.user_id / userId / user
+    - fallback "default"
+    """
+    u = payload.get("user")
+    if isinstance(u, str) and u.strip():
+        return u.strip()
+    md = payload.get("metadata")
+    if isinstance(md, dict):
+        u2 = md.get("user") or md.get("user_id") or md.get("userId")
+        if isinstance(u2, str) and u2.strip():
+            return u2.strip()
+    return "default"
 
 
-def _resolve_session_key(
+def _headers_for_conv(
+    conv: Conversation,
     *,
-    header_session: Optional[str],
-    conv_session: Optional[str],
-    allow_raw: bool,
-) -> Optional[str]:
-    if allow_raw and header_session:
-        return header_session
-    if conv_session:
-        return conv_session
-    return None
+    agent_override: Optional[str] = None,
+    agent_header_override: Optional[str] = None,
+    session_override: Optional[str] = None,
+) -> Dict[str, str]:
+    agent_id = (
+        (agent_header_override or "").strip()
+        or (agent_override or "").strip()
+        or (conv.agent_id or "").strip()
+        or settings.openclaw_default_agent_id
+    )
+
+    h: Dict[str, str] = {"x-openclaw-agent-id": agent_id}
+
+    sk = (session_override or "").strip() or (conv.openclaw_session_key or "").strip()
+    if sk:
+        h["x-openclaw-session-key"] = sk
+    return h
 
 
 # =============================================================================
-# Helpers: input normalization (structured -> prompt string)
+# Helpers: convert OpenAI-like payloads to OpenClaw simple payload
 # =============================================================================
 
+_Content = Union[str, List[Any], Dict[str, Any]]
 
-def _block_text(block: Any) -> str:
-    """Estrae testo da un content block OpenAI/OpenResponses-like."""
 
-    if isinstance(block, str):
-        return block
-    if not isinstance(block, dict):
+def _extract_text_from_content(content: _Content) -> str:
+    """
+    Estrae testo da:
+    - string
+    - list di parts {type: input_text/text/output_text, text: "..."}
+    - dict singolo (rare)
+    """
+    if content is None:
         return ""
-    t = block.get("type")
-    if t in {"input_text", "output_text", "text"}:
-        return str(block.get("text") or "")
-    # immagini/file: rendiamoli leggibili come placeholder
-    if t in {"input_image", "image_url"}:
-        return f"[image] {block.get('image_url') or block.get('url') or ''}".strip()
-    if t in {"input_file", "file_url"}:
-        return f"[file] {block.get('file_url') or block.get('url') or ''}".strip()
-    # fallback: prova campi comuni
-    return str(block.get("text") or block.get("url") or "")
-
-
-def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts = [_block_text(b) for b in content]
-        return "".join([p for p in parts if p])
     if isinstance(content, dict):
-        # in alcuni payload content può essere {type,text}
-        return _block_text(content)
-    return ""
-
-
-def _responses_input_to_prompt(inp: Any) -> str:
-    """Normalizza payload['input'] (Responses) in stringa."""
-
-    if isinstance(inp, str):
-        return inp
-
-    # OpenAI Responses può inviare input come array di message items
-    if isinstance(inp, list):
-        lines = []
-        for item in inp:
-            if not isinstance(item, dict):
+        t = content.get("type")
+        if t in {"input_text", "text", "output_text"}:
+            return str(content.get("text") or "")
+        return str(content.get("text") or content.get("content") or "")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
                 continue
-            role = str(item.get("role") or "user")
-            content = _content_to_text(item.get("content"))
-            if content:
-                lines.append(f"{role.upper()}: {content}")
-        return "\n".join(lines)
-
+            if isinstance(p, dict):
+                t = p.get("type")
+                if t in {"input_text", "text", "output_text"}:
+                    parts.append(str(p.get("text") or ""))
+                elif t in {"input_image", "image_url", "image"}:
+                    url = p.get("image_url") or p.get("url") or p.get("imageUrl")
+                    if url:
+                        parts.append(f"[image] {url}")
+                elif t in {"input_file", "file_url", "file"}:
+                    url = p.get("file_url") or p.get("url") or p.get("fileUrl")
+                    if url:
+                        parts.append(f"[file] {url}")
+                else:
+                    if "text" in p and p["text"]:
+                        parts.append(str(p["text"]))
+        return "".join(parts).strip()
     return ""
 
 
-def _chat_messages_to_prompt(messages: Any) -> str:
-    if not isinstance(messages, list):
-        return ""
-    lines = []
+def _messages_to_prompt(messages: List[dict]) -> str:
+    """
+    Trasforma una lista di messaggi OpenAI-like in una stringa.
+    Nota: se usi sessionKey lato gateway, spesso NON serve includere history.
+    Qui lo facciamo per compatibilità client-side.
+    """
+    lines: List[str] = []
     for m in messages:
         if not isinstance(m, dict):
             continue
         role = str(m.get("role") or "user")
-        content = _content_to_text(m.get("content"))
-        if content:
-            lines.append(f"{role.upper()}: {content}")
-    return "\n".join(lines)
+        text = _extract_text_from_content(m.get("content"))
+        if not text:
+            continue
+        lines.append(f"{role}: {text}")
+    return "\n".join(lines).strip()
 
 
-# =============================================================================
-# /v1/responses
-# =============================================================================
-
-
-@router.post("/v1/responses", summary="OpenAI-compatible Responses")
-async def openai_responses(
-    request: Request,
-    payload: dict = Body(...),
-    user: AuthenticatedUser = Depends(get_current_user),
-    x_bff_conversation_id: Optional[str] = Header(default=None),
-    x_openclaw_agent_id: Optional[str] = Header(default=None),
-    x_openclaw_session_key: Optional[str] = Header(default=None),
-    db=Depends(get_db),
-):
-    """Proxy compatibile Responses.
-
-    In upstream usiamo SEMPRE payload simple:
-      {"model":"openclaw","input":"<prompt>","stream":bool}
-
-    Per sessione/agent:
-    - agent: header x-openclaw-agent-id > model openclaw:<agent> > conv.agent_id > default
-    - session: se allow_raw_session_key=true, accetta header session key; altrimenti usa conv.openclaw_session_key
+def _responses_payload_to_prompt(payload: dict) -> str:
     """
-
-    conv_id = _safe_uuid(x_bff_conversation_id) if x_bff_conversation_id else None
-    conv = await _get_conversation_or_none(db, user.user_id, conv_id)
-
-    agent_id = _resolve_agent_id(
-        payload=payload,
-        header_agent=x_openclaw_agent_id,
-        conv_agent=(conv.agent_id if conv else None),
-    )
-
-    session_key = _resolve_session_key(
-        header_session=x_openclaw_session_key,
-        conv_session=(conv.openclaw_session_key if conv else None),
-        allow_raw=settings.allow_raw_session_key,
-    )
-
-    # normalize input
-    prompt = _responses_input_to_prompt(payload.get("input"))
-    if not prompt:
-        # Alcuni client mandano `messages` anche su /responses (best-effort)
-        prompt = _chat_messages_to_prompt(payload.get("messages"))
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Missing/invalid input")
-
-    stream = bool(payload.get("stream"))
-
-    upstream_payload = {"model": "openclaw", "input": prompt, "stream": stream}
-    headers: Dict[str, str] = {"x-openclaw-agent-id": agent_id}
-    if session_key:
-        headers["x-openclaw-session-key"] = session_key
-
-    try:
-        if stream:
-            return StreamingResponse(
-                stream_sse("/v1/responses", upstream_payload, headers=headers),
-                media_type="text/event-stream",
-            )
-
-        resp = await post_json("/v1/responses", upstream_payload, headers=headers)
-        return JSONResponse(resp)
-
-    except OpenClawHTTPError as e:
-        raise HTTPException(
-            status_code=502,
-            detail={"upstream": "openclaw", "status": e.status_code, "url": e.url, "error": e.error},
-        )
-
-
-# =============================================================================
-# /v1/chat/completions
-# =============================================================================
-
-
-@router.post("/v1/chat/completions", summary="OpenAI-compatible Chat Completions")
-async def openai_chat_completions(
-    request: Request,
-    payload: dict = Body(...),
-    user: AuthenticatedUser = Depends(get_current_user),
-    x_bff_conversation_id: Optional[str] = Header(default=None),
-    x_openclaw_agent_id: Optional[str] = Header(default=None),
-    x_openclaw_session_key: Optional[str] = Header(default=None),
-    db=Depends(get_db),
-):
-    """Proxy compatibile ChatCompletions.
-
-    Strategia:
-    - Convertiamo messages[] -> prompt string
-    - Chiamiamo upstream /v1/responses in modalità simple
-    - Convertiamo risposta in schema chat.completion (o chunk stream)
-
-    Nota: il *modello* effettivo è deciso dall'agent in OpenClaw.
+    Supporta OpenAI Responses:
+    - input può essere string o lista messaggi
+    - `instructions` viene anteposto come system
     """
+    instructions = payload.get("instructions")
+    sys_txt = ""
+    if isinstance(instructions, str) and instructions.strip():
+        sys_txt = f"system: {instructions.strip()}"
 
-    conv_id = _safe_uuid(x_bff_conversation_id) if x_bff_conversation_id else None
-    conv = await _get_conversation_or_none(db, user.user_id, conv_id)
+    inp = payload.get("input")
+    prompt = ""
+    if isinstance(inp, str):
+        prompt = inp
+    elif isinstance(inp, list):
+        prompt = _messages_to_prompt(inp)
+    elif isinstance(inp, dict):
+        prompt = _messages_to_prompt([inp])
 
-    agent_id = _resolve_agent_id(
-        payload=payload,
-        header_agent=x_openclaw_agent_id,
-        conv_agent=(conv.agent_id if conv else None),
-    )
+    prompt = (prompt or "").strip()
+    if sys_txt:
+        return (sys_txt + ("\n" + prompt if prompt else "")).strip()
+    return prompt
 
-    session_key = _resolve_session_key(
-        header_session=x_openclaw_session_key,
-        conv_session=(conv.openclaw_session_key if conv else None),
-        allow_raw=settings.allow_raw_session_key,
-    )
 
-    prompt = _chat_messages_to_prompt(payload.get("messages"))
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Missing/invalid messages")
+def _chat_payload_to_prompt(payload: dict) -> str:
+    """
+    OpenAI ChatCompletions:
+    - messages[] obbligatorio
+    """
+    messages = payload.get("messages") or []
+    if isinstance(messages, list):
+        return _messages_to_prompt(messages)
+    return str(messages)
 
-    stream = bool(payload.get("stream"))
 
-    upstream_payload = {"model": "openclaw", "input": prompt, "stream": stream}
-    headers: Dict[str, str] = {"x-openclaw-agent-id": agent_id}
-    if session_key:
-        headers["x-openclaw-session-key"] = session_key
-
-    chat_id = f"chatcmpl_{uuid.uuid4().hex}"
-    created = int(time.time())
-
-    try:
-        if not stream:
-            resp = await post_json("/v1/responses", upstream_payload, headers=headers)
-            assistant_text = extract_output_text(resp)
-
-            out = {
-                "id": chat_id,
-                "object": "chat.completion",
-                "created": created,
-                "model": payload.get("model") or "openclaw",
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": assistant_text},
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
-            # usage best-effort
-            usage = resp.get("usage") if isinstance(resp, dict) else None
-            if isinstance(usage, dict):
-                out["usage"] = {
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                }
-            return JSONResponse(out)
-
-        # streaming: translate response.output_text.delta -> chat.completion.chunk
-        async def gen() -> AsyncGenerator[bytes, None]:
-            byte_stream = stream_sse("/v1/responses", upstream_payload, headers=headers)
-            async for ev in iter_sse_events(byte_stream):
-                # OpenResponses delta events
-                if ev.event.endswith("output_text.delta") or ev.event.endswith("response.output_text.delta"):
-                    try:
-                        j = json.loads(ev.data)
-                        delta = j.get("delta") or j.get("text") or ""
-                    except Exception:
-                        delta = ""
-                    if not delta:
-                        continue
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": payload.get("model") or "openclaw",
-                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
-                    }
-                    yield b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n"
-                    continue
-
-                if ev.event.endswith("completed") or ev.event.endswith("response.completed"):
-                    chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": payload.get("model") or "openclaw",
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                    }
-                    yield b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n"
-                    yield b"data: [DONE]\n\n"
-                    return
-
-                # se l'upstream manda [DONE] come message
-                if ev.data.strip() == "[DONE]":
-                    yield b"data: [DONE]\n\n"
-                    return
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    except OpenClawHTTPError as e:
-        raise HTTPException(
-            status_code=502,
-            detail={"upstream": "openclaw", "status": e.status_code, "url": e.url, "error": e.error},
-        )
+def _to_openclaw_simple_payload(prompt: str, *, stream: bool) -> Dict[str, Any]:
+    return {"model": "openclaw", "input": prompt, "stream": bool(stream)}
 
 
 # =============================================================================
 # /v1/models
 # =============================================================================
 
+@router.get("/v1/models")
+async def v1_models(user: AuthenticatedUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    convs = (
+        await db.execute(
+            select(Conversation)
+            .where(Conversation.user_id == user.user_id, Conversation.is_deleted.is_(False))
+            .order_by(Conversation.created_at.asc())
+            .limit(200)
+        )
+    ).scalars().all()
 
-@router.get("/v1/models", summary="List models (compat)")
-async def openai_models(_: AuthenticatedUser = Depends(get_current_user)):
-    """Ritorna una lista minima. Il routing vero è dentro OpenClaw agent."""
+    agents = sorted({(c.agent_id or settings.openclaw_default_agent_id) for c in convs})
+    if not agents:
+        agents = [settings.openclaw_default_agent_id]
 
-    # Se vuoi, qui puoi interrogare OpenClaw, ma per ora teniamo statico
-    return {
-        "object": "list",
-        "data": [
-            {"id": "openclaw", "object": "model", "owned_by": "openclaw"},
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": [{"id": f"openclaw:{a}", "object": "model", "owned_by": "openclaw"} for a in agents],
+        }
+    )
+
+
+# =============================================================================
+# /v1/responses (PROXY -> OpenClaw /v1/responses, ma SIMPLE)
+# =============================================================================
+
+@router.post("/v1/responses")
+async def v1_responses(
+    request: Request,
+    x_bff_conversation_id: Optional[str] = Header(default=None, alias="x-bff-conversation-id"),
+    x_openclaw_session_key: Optional[str] = Header(default=None, alias="x-openclaw-session-key"),
+    x_openclaw_agent_id: Optional[str] = Header(default=None, alias="x-openclaw-agent-id"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    if x_bff_conversation_id:
+        conv = await _get_conversation_by_id(db, user.user_id, x_bff_conversation_id)
+    else:
+        alias = _infer_alias_from_payload(payload)
+        conv = await _get_or_create_conversation_by_alias(db, user.user_id, alias)
+
+    agent_override = _infer_agent_from_payload(payload)
+    session_override: Optional[str] = None
+    if settings.allow_raw_openclaw_session_key and x_openclaw_session_key:
+        session_override = x_openclaw_session_key
+
+    headers = _headers_for_conv(
+        conv,
+        agent_override=agent_override,
+        agent_header_override=x_openclaw_agent_id,
+        session_override=session_override,
+    )
+
+    prompt = _responses_payload_to_prompt(payload)
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "input: Invalid input", "type": "invalid_request_error"}},
+        )
+
+    stream = bool(payload.get("stream"))
+    upstream_payload = _to_openclaw_simple_payload(prompt, stream=stream)
+
+    if stream:
+        async def _gen():
+            try:
+                async for b in stream_sse("/v1/responses", upstream_payload, headers=headers):
+                    yield b
+            except Exception as e:
+                yield f"event: error\ndata: {json.dumps({'message': str(e)})}\n\n".encode("utf-8")
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    try:
+        resp = await post_json("/v1/responses", upstream_payload, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"upstream": "openclaw", "message": str(e)})
+
+    return JSONResponse(resp)
+
+
+# =============================================================================
+# /v1/chat/completions (IMPLEMENTATO VIA /v1/responses SIMPLE)
+# =============================================================================
+
+def _chat_completion_response(
+    *,
+    content: str,
+    model: str,
+    created: int,
+    completion_id: str,
+    prompt_tokens: Optional[int] = None,
+    completion_tokens: Optional[int] = None,
+    total_tokens: Optional[int] = None,
+) -> dict:
+    usage = None
+    if total_tokens is not None:
+        usage = {
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens),
+        }
+
+    out = {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
         ],
     }
+    if usage is not None:
+        out["usage"] = usage
+    return out
+
+
+def _chat_chunk(
+    *,
+    completion_id: str,
+    model: str,
+    created: int,
+    delta: Optional[str] = None,
+    role: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+) -> dict:
+    d: Dict[str, Any] = {}
+    if role:
+        d["role"] = role
+    if delta is not None:
+        d["content"] = delta
+    return {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": d, "finish_reason": finish_reason}],
+    }
+
+
+@router.post("/v1/chat/completions")
+async def v1_chat_completions(
+    request: Request,
+    x_bff_conversation_id: Optional[str] = Header(default=None, alias="x-bff-conversation-id"),
+    x_openclaw_session_key: Optional[str] = Header(default=None, alias="x-openclaw-session-key"),
+    x_openclaw_agent_id: Optional[str] = Header(default=None, alias="x-openclaw-agent-id"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    if x_bff_conversation_id:
+        conv = await _get_conversation_by_id(db, user.user_id, x_bff_conversation_id)
+    else:
+        alias = _infer_alias_from_payload(payload)
+        conv = await _get_or_create_conversation_by_alias(db, user.user_id, alias)
+
+    agent_override = _infer_agent_from_payload(payload)
+    session_override: Optional[str] = None
+    if settings.allow_raw_openclaw_session_key and x_openclaw_session_key:
+        session_override = x_openclaw_session_key
+
+    headers = _headers_for_conv(
+        conv,
+        agent_override=agent_override,
+        agent_header_override=x_openclaw_agent_id,
+        session_override=session_override,
+    )
+
+    prompt = _chat_payload_to_prompt(payload)
+    if not prompt:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"message": "messages: Invalid input", "type": "invalid_request_error"}},
+        )
+
+    stream = bool(payload.get("stream"))
+    upstream_payload = _to_openclaw_simple_payload(prompt, stream=stream)
+
+    client_model = str(payload.get("model") or f"openclaw:{headers.get('x-openclaw-agent-id')}")
+
+    if stream:
+        completion_id = f"chatcmpl_{uuid.uuid4().hex}"
+        created = int(time.time())
+
+        async def _gen():
+            yield f"data: {json.dumps(_chat_chunk(completion_id=completion_id, model=client_model, created=created, role='assistant'))}\n\n".encode("utf-8")
+            try:
+                async for ev in iter_sse_events(stream_sse("/v1/responses", upstream_payload, headers=headers)):
+                    if ev.event.endswith("output_text.delta"):
+                        try:
+                            j = json.loads(ev.data)
+                        except Exception:
+                            continue
+                        delta = j.get("delta") or j.get("text") or ""
+                        if delta:
+                            yield f"data: {json.dumps(_chat_chunk(completion_id=completion_id, model=client_model, created=created, delta=str(delta)))}\n\n".encode("utf-8")
+
+                    if ev.event.endswith("completed"):
+                        break
+
+                yield f"data: {json.dumps(_chat_chunk(completion_id=completion_id, model=client_model, created=created, finish_reason='stop'))}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+            except Exception as e:
+                err = {"error": {"message": str(e), "type": "api_error"}}
+                yield f"data: {json.dumps(err)}\n\n".encode("utf-8")
+                yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    try:
+        resp = await post_json("/v1/responses", upstream_payload, headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"upstream": "openclaw", "message": str(e)})
+
+    content = extract_output_text(resp)
+    usage = resp.get("usage") if isinstance(resp, dict) else None
+
+    return JSONResponse(
+        _chat_completion_response(
+            content=content,
+            model=client_model,
+            created=int(time.time()),
+            completion_id=f"chatcmpl_{uuid.uuid4().hex}",
+            prompt_tokens=(usage or {}).get("input_tokens") if isinstance(usage, dict) else None,
+            completion_tokens=(usage or {}).get("output_tokens") if isinstance(usage, dict) else None,
+            total_tokens=(usage or {}).get("total_tokens") if isinstance(usage, dict) else None,
+        )
+    )
+
+
+# =============================================================================
+# /tools/invoke (proxy)
+# =============================================================================
+
+@router.post("/tools/invoke")
+async def tools_invoke(
+    request: Request,
+    x_bff_conversation_id: Optional[str] = Header(default=None, alias="x-bff-conversation-id"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    if x_bff_conversation_id:
+        conv = await _get_conversation_by_id(db, user.user_id, x_bff_conversation_id)
+    else:
+        alias = _infer_alias_from_payload(payload)
+        conv = await _get_or_create_conversation_by_alias(db, user.user_id, alias)
+
+    payload = dict(payload)
+    payload.setdefault("sessionKey", conv.openclaw_session_key)
+
+    try:
+        resp = await post_json("/tools/invoke", payload)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"upstream": "openclaw", "message": str(e)})
+
+    return JSONResponse(resp)
