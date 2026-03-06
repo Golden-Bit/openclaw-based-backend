@@ -79,3 +79,11 @@ Questi endpoint **passano sempre dal BFF** e applicano ownership/isolamento sess
 - Il FE usa `conversationId`; il BFF mappa su `openclawSessionKey` interno.
 - Per compat OpenAI, il campo `user` (o header `x-bff-conversation-id`) viene usato per il routing.
 
+
+
+
+
+##----------------------------------------##
+chmod +x scripts/*.sh
+set -a; source .env; set +a
+##----------------------------------------##
