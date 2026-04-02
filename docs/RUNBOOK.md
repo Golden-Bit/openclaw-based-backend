@@ -57,6 +57,7 @@ Endpoint utili:
 - Health: `http://localhost:8000/api/v1/health`
 - Gateway info: `http://localhost:8000/api/v1/gateway/info`
 - Agents list: `http://localhost:8000/api/v1/agents`
+- Agent knowledge tree: `http://localhost:8000/api/v1/agents/main/knowledge/tree`
 
 ## 5) Test
 

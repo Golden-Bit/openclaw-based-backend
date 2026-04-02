@@ -103,6 +103,18 @@ In shutdown:
 - `PATCH /api/v1/agents/{agent_id}` -> WS `agents.update`
 - `DELETE /api/v1/agents/{agent_id}` -> WS `agents.delete`
 
+### 7) Agent knowledge workspace files
+- Root fisica gestita dal BFF: `<workspace>/memory/knowledge`
+- Endpoint CRUD cartelle/file: `/api/v1/agents/{agent_id}/knowledge/*`
+- Upload supportati: multipart e base64
+- Sicurezza path:
+  - solo path relative
+  - blocco `..`, path assoluti e home-relative
+  - verifica risoluzione dentro knowledge root
+  - blocco symlink chain/hardlink file
+
+Nota su indexing: il trigger `POST .../reindex` è best-effort (`eventual`), perché non esiste un singolo metodo gateway standard per forzare reindex immediato in tutte le build.
+
 Nota: il BFF non persiste anagrafiche agenti su DB locale. Il source of truth resta OpenClaw.
 
 ## Sicurezza

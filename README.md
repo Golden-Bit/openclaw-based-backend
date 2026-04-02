@@ -49,6 +49,18 @@ Il servizio integra:
 - `PATCH /api/v1/agents/{agent_id}`
 - `DELETE /api/v1/agents/{agent_id}`
 
+#### Agent Knowledge Files
+- `GET /api/v1/agents/{agent_id}/knowledge/tree`
+- `POST /api/v1/agents/{agent_id}/knowledge/folders`
+- `PATCH /api/v1/agents/{agent_id}/knowledge/folders`
+- `DELETE /api/v1/agents/{agent_id}/knowledge/folders`
+- `POST /api/v1/agents/{agent_id}/knowledge/files/upload`
+- `POST /api/v1/agents/{agent_id}/knowledge/files/base64`
+- `PUT /api/v1/agents/{agent_id}/knowledge/files`
+- `DELETE /api/v1/agents/{agent_id}/knowledge/files`
+- `GET /api/v1/agents/{agent_id}/knowledge/files/content`
+- `POST /api/v1/agents/{agent_id}/knowledge/reindex`
+
 #### Uploads
 - `POST /api/v1/uploads` (multipart upload diretto)
 - `POST /api/v1/uploads/bytes`
@@ -135,6 +147,7 @@ Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `
 - Payload e schemi esposti dal BFF usano naming **snake_case** (`conversation_id`, `agent_id`, `client_message_id`, ...).
 - Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF).
 - In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
+- Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e non usano MinIO.
 
 ## Script utili
 

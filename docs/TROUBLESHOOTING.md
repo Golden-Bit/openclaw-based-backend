@@ -109,3 +109,27 @@
 ### Verifica/Fix
 - controlla `GET /api/v1/agents/{agent_id}` per enrichment (`identity` e opzionalmente `files`)
 - se necessario aggiorna l'agente via `PATCH /api/v1/agents/{agent_id}` per valorizzare `name/workspace/model`
+
+---
+
+## Errori `400` su knowledge path (`/api/v1/agents/{agent_id}/knowledge/*`)
+
+### Causa
+- path non valida (assoluta, `..`, home-relative, escape root)
+
+### Verifica/Fix
+- usa sempre path **relative** alla root knowledge (`<workspace>/memory/knowledge`)
+- evita prefissi `/`, `~`, e segmenti `..`
+
+---
+
+## `409` su upload/replace knowledge file
+
+### Causa
+- path destinazione già occupato da cartella
+- file esistente con `overwrite=false`
+- `PUT /files` su file mancante con `upsert=false`
+
+### Verifica/Fix
+- abilita `overwrite=true` per endpoint upload
+- usa `upsert=true` su `PUT /files` quando vuoi creare se assente

@@ -106,6 +106,64 @@ curl -s -X DELETE "http://localhost:8000/api/v1/agents/main?delete_files=true" \
   -H 'X-Debug-User: dev-user' | jq
 ```
 
+## Agent knowledge tree
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main/knowledge/tree?path=" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Create knowledge folder
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/folders" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs"}' | jq
+```
+
+## Upload knowledge file (multipart)
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/upload" \
+  -H 'X-Debug-User: dev-user' \
+  -F "path=project-a/docs" \
+  -F "overwrite=true" \
+  -F "file=@./README.md" | jq
+```
+
+## Upload knowledge file (base64)
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/base64" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs","filename":"note.md","content_base64":"IyBIZWxsbwo=","overwrite":true}' | jq
+```
+
+## Read knowledge file content
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main/knowledge/files/content?path=project-a/docs/note.md" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Replace knowledge file content (PUT)
+
+```bash
+curl -s -X PUT "http://localhost:8000/api/v1/agents/main/knowledge/files" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs/note.md","content_base64":"IyBVcGRhdGVkCg==","upsert":true}' | jq
+```
+
+## Delete knowledge file
+
+```bash
+curl -s -X DELETE "http://localhost:8000/api/v1/agents/main/knowledge/files?path=project-a/docs/note.md" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
 ## Invoke tool in conversation
 
 ```bash
