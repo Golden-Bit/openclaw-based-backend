@@ -59,6 +59,7 @@ Il servizio integra:
 - `PUT /api/v1/agents/{agent_id}/knowledge/files`
 - `DELETE /api/v1/agents/{agent_id}/knowledge/files`
 - `GET /api/v1/agents/{agent_id}/knowledge/files/content`
+- `GET /api/v1/agents/{agent_id}/knowledge/files/download`
 - `POST /api/v1/agents/{agent_id}/knowledge/reindex`
 
 #### Uploads

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
 
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.core.config import settings
@@ -453,6 +454,25 @@ async def read_file_content(
         content_text=content_text,
         content_base64=content_base64,
     )
+
+
+@router.get("/files/download", summary="Download file from knowledge")
+async def download_file(
+    agent_id: str,
+    path: str = Query(..., description="Path relativa file"),
+    _: AuthenticatedUser = Depends(get_current_user),
+) -> FileResponse:
+    _aid, _ws, _workspace, root = await _agent_context(agent_id)
+    try:
+        _rel, target = _resolve_file(root, path)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError(str(target))
+        reject_hardlinked_file(target)
+    except Exception as e:  # noqa: BLE001
+        raise _map_path_error(e)
+
+    media_type = detect_mime_from_name(target.name)
+    return FileResponse(path=target, filename=target.name, media_type=media_type)
 
 
 @router.post(

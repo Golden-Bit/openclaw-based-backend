@@ -148,6 +148,14 @@ curl -s "http://localhost:8000/api/v1/agents/main/knowledge/files/content?path=p
   -H 'X-Debug-User: dev-user' | jq
 ```
 
+## Download knowledge file
+
+```bash
+curl -L "http://localhost:8000/api/v1/agents/main/knowledge/files/download?path=project-a/docs/note.md" \
+  -H 'X-Debug-User: dev-user' \
+  -o ./note.md
+```
+
 ## Replace knowledge file content (PUT)
 
 ```bash

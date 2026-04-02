@@ -208,6 +208,18 @@ def test_reindex_best_effort(monkeypatch: MonkeyPatch, tmp_path: Path):
     assert ws.calls == [("doctor.memory.status", {})]
 
 
+def test_download_file_response(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    (root / "dl").mkdir(parents=True)
+    p = root / "dl" / "file.md"
+    p.write_text("download-me", encoding="utf-8")
+
+    res = asyncio.run(knowledge_endpoint.download_file("main", path="dl/file.md"))
+
+    assert res.filename == "file.md"
+    assert str(res.path).endswith(str(p))
+
+
 def test_agent_context_rejects_relative_workspace(monkeypatch: MonkeyPatch):
     async def _get_connected_ws():
         return _FakeWS()
