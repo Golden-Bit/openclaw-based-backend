@@ -44,6 +44,7 @@ Il servizio integra:
 
 #### Agents
 - `GET /api/v1/agents`
+- `POST /api/v1/agents`
 - `GET /api/v1/agents/{agent_id}`
 - `PATCH /api/v1/agents/{agent_id}`
 - `DELETE /api/v1/agents/{agent_id}`
@@ -133,6 +134,7 @@ Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `
 - Nota implementativa: `POST /api/v1/conversations/{conversation_id}/messages` include attualmente `openclaw_response.session_key` nel payload di risposta (campo diagnostico/compatibilità).
 - Payload e schemi esposti dal BFF usano naming **snake_case** (`conversation_id`, `agent_id`, `client_message_id`, ...).
 - Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF).
+- In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
 
 ## Script utili
 

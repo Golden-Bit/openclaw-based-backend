@@ -8,6 +8,8 @@ from app.core.config import settings
 from app.core.openclaw_ws import OpenClawWSClient
 from app.core.security import AuthenticatedUser, get_current_user
 from app.schemas.agents import (
+    AgentCreateRequest,
+    AgentCreateResponse,
     AgentDeleteResponse,
     AgentDetailResponse,
     AgentListResponse,
@@ -71,11 +73,14 @@ async def _get_connected_ws():
 
 def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> AgentSummary:
     model_raw = raw.get("model")
+    identity_raw = raw.get("identity")
 
     model: Optional[str] = None
     model_fallbacks: Optional[List[str]] = None
 
-    if isinstance(model_raw, dict):
+    if isinstance(model_raw, str) and model_raw.strip():
+        model = model_raw.strip()
+    elif isinstance(model_raw, dict):
         primary = model_raw.get("primary")
         if isinstance(primary, str) and primary.strip():
             model = primary.strip()
@@ -87,6 +92,8 @@ def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> A
 
     agent_id = str(raw.get("id") or "").strip()
     name = raw.get("name")
+    if (not isinstance(name, str) or not name.strip()) and isinstance(identity_raw, dict):
+        name = identity_raw.get("name")
     workspace = raw.get("workspace")
 
     return AgentSummary(
@@ -96,6 +103,73 @@ def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> A
         model=model,
         model_fallbacks=model_fallbacks,
         is_default=(agent_id == default_agent_id),
+    )
+
+
+@router.post(
+    "",
+    summary="Crea agente OpenClaw",
+    response_model=AgentCreateResponse,
+)
+async def create_agent(
+    body: AgentCreateRequest,
+    _: AuthenticatedUser = Depends(get_current_user),
+) -> AgentCreateResponse:
+    name = body.name.strip()
+    workspace = body.workspace.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="name cannot be empty")
+    if not workspace:
+        raise HTTPException(status_code=400, detail="workspace cannot be empty")
+
+    params: Dict[str, Any] = {
+        "name": name,
+        "workspace": workspace,
+    }
+
+    if body.emoji is not None:
+        emoji = body.emoji.strip()
+        if not emoji:
+            raise HTTPException(status_code=400, detail="emoji cannot be empty")
+        params["emoji"] = emoji
+
+    if body.avatar is not None:
+        avatar = body.avatar.strip()
+        if not avatar:
+            raise HTTPException(status_code=400, detail="avatar cannot be empty")
+        params["avatar"] = avatar
+
+    ws = await _get_connected_ws()
+
+    try:
+        res = await ws.call("agents.create", params)
+    except Exception as e:  # noqa: BLE001
+        raise _map_ws_error("agents.create", e)
+
+    agent_id: Optional[str] = None
+    result_name: Optional[str] = name
+    result_workspace: Optional[str] = workspace
+
+    if isinstance(res, dict):
+        rid = res.get("agentId")
+        if isinstance(rid, str) and rid.strip():
+            agent_id = rid.strip()
+
+        rname = res.get("name")
+        if isinstance(rname, str) and rname.strip():
+            result_name = rname.strip()
+
+        rworkspace = res.get("workspace")
+        if isinstance(rworkspace, str) and rworkspace.strip():
+            result_workspace = rworkspace.strip()
+
+    return AgentCreateResponse(
+        created=True,
+        agent_id=agent_id,
+        name=result_name,
+        workspace=result_workspace,
+        openclaw_result=(res if isinstance(res, dict) else {"payload": res}),
     )
 
 

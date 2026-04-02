@@ -97,3 +97,15 @@
 ### Stato attuale
 - API BFF espone prevalentemente payload snake_case (`conversation_id`, `agent_id`, `client_message_id`, ...)
 - endpoint upload principale (`POST /api/v1/uploads`) è upload diretto multipart, non presign-only
+
+---
+
+## `/api/v1/agents` restituisce `name/workspace/model = null`
+
+### Causa
+- il gateway OpenClaw può restituire agent summary parziali (es. solo `id`)
+- campi opzionali non valorizzati lato agente risultano `null` nel payload BFF
+
+### Verifica/Fix
+- controlla `GET /api/v1/agents/{agent_id}` per enrichment (`identity` e opzionalmente `files`)
+- se necessario aggiorna l'agente via `PATCH /api/v1/agents/{agent_id}` per valorizzare `name/workspace/model`

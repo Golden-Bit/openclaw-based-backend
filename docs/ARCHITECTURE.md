@@ -9,7 +9,7 @@ OpenClaw BFF espone due superfici:
 
 Il backend comunica con OpenClaw via:
 - **HTTP**: `/v1/responses`, `/v1/chat/completions`, `/tools/invoke`
-- **WebSocket RPC**: `agent`, `agent.wait`, `chat.history`, `chat.abort`, `chat.inject`, `tools.catalog`, `agents.list`, `agent.identity.get`, `agents.files.list`, `agents.update`, `agents.delete`
+- **WebSocket RPC**: `agent`, `agent.wait`, `chat.history`, `chat.abort`, `chat.inject`, `tools.catalog`, `agents.list`, `agents.create`, `agent.identity.get`, `agents.files.list`, `agents.update`, `agents.delete`
 
 ## Componenti
 
@@ -98,6 +98,7 @@ In shutdown:
 
 ### 6) Agents management
 - `GET /api/v1/agents` -> WS `agents.list`
+- `POST /api/v1/agents` -> WS `agents.create`
 - `GET /api/v1/agents/{agent_id}` -> `agents.list` + enrichment best-effort (`agent.identity.get`, opzionale `agents.files.list`)
 - `PATCH /api/v1/agents/{agent_id}` -> WS `agents.update`
 - `DELETE /api/v1/agents/{agent_id}` -> WS `agents.delete`

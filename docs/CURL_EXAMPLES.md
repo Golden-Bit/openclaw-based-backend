@@ -74,6 +74,15 @@ curl -s http://localhost:8000/api/v1/agents \
   -H 'X-Debug-User: dev-user' | jq
 ```
 
+## Create agent
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/agents \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"name":"Support Agent","workspace":"/tmp/support-agent","emoji":"🤖"}' | jq
+```
+
 ## Agent detail
 
 ```bash

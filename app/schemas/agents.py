@@ -33,6 +33,23 @@ class AgentDetailResponse(AgentSummary):
     warnings: List[str] = Field(default_factory=list, description="Warning non bloccanti (es. metodo non supportato)")
 
 
+class AgentCreateRequest(BaseModel):
+    """Campi necessari/ammessi su OpenClaw agents.create."""
+
+    name: str = Field(description="Nome nuovo agente")
+    workspace: str = Field(description="Workspace nuovo agente")
+    emoji: Optional[str] = Field(default=None, description="Emoji agente")
+    avatar: Optional[str] = Field(default=None, description="Avatar agente")
+
+
+class AgentCreateResponse(BaseModel):
+    created: bool = Field(description="True se create richiesto con successo")
+    agent_id: Optional[str] = Field(default=None, description="Identificativo agente creato")
+    name: Optional[str] = Field(default=None, description="Nome agente creato")
+    workspace: Optional[str] = Field(default=None, description="Workspace agente creato")
+    openclaw_result: Optional[Dict[str, Any]] = Field(default=None, description="Payload upstream (best-effort)")
+
+
 class AgentUpdateRequest(BaseModel):
     """Campi aggiornabili su OpenClaw agents.update."""
 

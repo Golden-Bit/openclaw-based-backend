@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api.v1.endpoints import agents as agents_endpoint
-from app.schemas.agents import AgentUpdateRequest
+from app.schemas.agents import AgentCreateRequest, AgentUpdateRequest
 
 
 class _FakeWS:
@@ -81,6 +81,74 @@ def test_list_agents_success(monkeypatch: MonkeyPatch):
     assert res.items[0].model == "gpt-4.1"
     assert res.items[0].model_fallbacks == ["gpt-4o-mini"]
     assert ws.calls == [("agents.list", {})]
+
+
+def test_list_agents_uses_identity_name_and_string_model(monkeypatch: MonkeyPatch):
+    ws = _FakeWS(
+        responses={
+            "agents.list": {
+                "defaultId": "main",
+                "mainKey": "key-1",
+                "scope": "per-sender",
+                "agents": [
+                    {
+                        "id": "main",
+                        "name": "",
+                        "identity": {"name": "Main from identity"},
+                        "workspace": None,
+                        "model": "openai:gpt-4.1",
+                    }
+                ],
+            }
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+
+    res = asyncio.run(agents_endpoint.list_agents())
+
+    assert len(res.items) == 1
+    assert res.items[0].name == "Main from identity"
+    assert res.items[0].model == "openai:gpt-4.1"
+
+
+def test_create_agent_success(monkeypatch: MonkeyPatch):
+    ws = _FakeWS(responses={"agents.create": {"ok": True, "agentId": "a-1", "name": "Agent 1", "workspace": "/tmp/a1"}})
+    _patch_ws(monkeypatch, ws)
+
+    res = asyncio.run(
+        agents_endpoint.create_agent(
+            AgentCreateRequest(name="Agent 1", workspace="/tmp/a1", emoji="🤖"),
+        )
+    )
+
+    assert res.created is True
+    assert res.agent_id == "a-1"
+    assert res.name == "Agent 1"
+    assert res.workspace == "/tmp/a1"
+    assert ws.calls == [
+        (
+            "agents.create",
+            {
+                "name": "Agent 1",
+                "workspace": "/tmp/a1",
+                "emoji": "🤖",
+            },
+        )
+    ]
+
+
+def test_create_agent_rejects_empty_workspace(monkeypatch: MonkeyPatch):
+    ws = _FakeWS()
+    _patch_ws(monkeypatch, ws)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            agents_endpoint.create_agent(
+                AgentCreateRequest(name="Agent 1", workspace="   "),
+            )
+        )
+
+    assert exc_info.value.status_code == 400
 
 
 def test_get_agent_with_identity_and_files(monkeypatch: MonkeyPatch):
