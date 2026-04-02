@@ -1,40 +1,115 @@
 # OpenClaw BFF (Backend for Frontend)
 
-Backend **FastAPI** che espone una **Public REST API** per un frontend stile ChatGPT, mentre comunica con **OpenClaw Gateway** in locale tramite:
+Backend **FastAPI** che espone una API pubblica per frontend stile chat e, in parallelo, endpoint OpenAI-compatible.
 
-- **HTTP**: OpenResponses (`/v1/responses`), OpenAI Chat Completions (`/v1/chat/completions`), Tools Invoke (`/tools/invoke`)
-- **WebSocket**: metodi RPC (`chat.history`, `chat.abort`, `chat.inject`, `sessions.list`, `tools.catalog`, ecc.)
+Il servizio integra:
+- **OpenClaw Gateway** via HTTP e WebSocket RPC
+- **PostgreSQL** per persistenza conversazioni/messaggi/uploads
+- **MinIO** per object storage
+- **Keycloak** opzionale per autenticazione JWT
 
-Inoltre integra:
+## Architettura in breve
 
-- **PostgreSQL** per persistenza conversazioni/messaggi/mapping sessioni
-- **MinIO** per upload file (presigned URL)
-- **Keycloak** (opzionale) per autenticazione JWT, disattivabile via ENV.
+- Le API BFF principali sono sotto ` /api/v1 `.
+- Le API OpenAI-compatible sono sotto ` /v1/* ` più ` /tools/invoke `.
+- Le conversazioni utente usano `conversation_id` (UUID pubblico) e mappano internamente a `openclaw_session_key`.
+- Il flusso messaggi usa principalmente il loop **WS agent** (`agent`, `agent.wait`, subscribe eventi), con bridge SSE verso il frontend.
+
+## API effettive
+
+### 1) BFF API (`/api/v1`)
+
+#### Health e gateway
+- `GET /api/v1/health`
+- `GET /api/v1/gateway/info`
+
+#### Conversations
+- `POST /api/v1/conversations`
+- `GET /api/v1/conversations`
+- `GET /api/v1/conversations/{conversation_id}`
+- `PATCH /api/v1/conversations/{conversation_id}`
+- `DELETE /api/v1/conversations/{conversation_id}` (soft delete)
+
+#### Messages
+- `GET /api/v1/conversations/{conversation_id}/messages?source=db|gateway`
+- `POST /api/v1/conversations/{conversation_id}/messages` (non-stream)
+- `POST /api/v1/conversations/{conversation_id}/messages/stream` (SSE)
+- `POST /api/v1/conversations/{conversation_id}/abort`
+- `POST /api/v1/conversations/{conversation_id}/inject`
+
+#### Tools
+- `GET /api/v1/tools/catalog`
+- `POST /api/v1/conversations/{conversation_id}/tools/invoke`
+- `POST /api/v1/conversations/{conversation_id}/tool-results`
+
+#### Agents
+- `GET /api/v1/agents`
+- `GET /api/v1/agents/{agent_id}`
+- `PATCH /api/v1/agents/{agent_id}`
+- `DELETE /api/v1/agents/{agent_id}`
+
+#### Uploads
+- `POST /api/v1/uploads` (multipart upload diretto)
+- `POST /api/v1/uploads/bytes`
+- `POST /api/v1/uploads/base64`
+- `POST /api/v1/uploads/presign` (compatibilità presigned flow)
+- `GET /api/v1/uploads`
+- `GET /api/v1/uploads/{upload_id}`
+- `GET /api/v1/uploads/{upload_id}/links`
+- `GET /api/v1/uploads/{upload_id}/download`
+- `PATCH /api/v1/uploads/{upload_id}`
+- `PUT /api/v1/uploads/{upload_id}/content`
+- `PUT /api/v1/uploads/{upload_id}/content/base64`
+- `DELETE /api/v1/uploads/{upload_id}`
+
+### 2) OpenAI-compatible surface
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/completions` (legacy, tradotto internamente in chat completions)
+- `POST /tools/invoke`
+
+Nota: questa surface è un proxy autenticato verso OpenClaw; non usa il mapping conversazioni BFF come fanno gli endpoint `/api/v1/conversations/*`.
 
 ## Quick start (locale)
 
-1) Crea DB `openclaw_bff` in Postgres e assicurati che Postgres sia in esecuzione.
-2) Avvia MinIO in locale e crea (o lascia creare) il bucket `openclaw-bff`.
-3) Avvia OpenClaw Gateway in locale e annota:
-   - base HTTP (es. `http://127.0.0.1:3434`)
-   - WS URL (es. `ws://127.0.0.1:3434/ws`)
-   - token (se richiesto dal tuo gateway)
+### Prerequisiti
+- Docker + Docker Compose
+- Python 3.12+
+- OpenClaw Gateway attivo sull’host
 
-### Run con venv
+### 1) Config
+
+```bash
+cp .env.example .env
+```
+
+Aggiorna almeno:
+- `DATABASE_URL`
+- `OPENCLAW_HTTP_BASE`
+- `OPENCLAW_WS_URL`
+- `OPENCLAW_BEARER_TOKEN` (se richiesto dal gateway)
+- `OPENCLAW_IDENTITY_FILE` (consigliato, identity device del client OpenClaw)
+- `OPENCLAW_STATE_DIR` (fallback per identity locale generata dal BFF)
+- `KEYCLOAK_ENABLED`
+
+### 2) Infra locale (Postgres/MinIO/Keycloak)
+
+```bash
+./scripts/init_all.sh
+```
+
+### 3) Avvio backend
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# Config
-cp .env.example .env
-# modifica .env se necessario
-
-uvicorn app.main:app --reload --port 8000
+./scripts/dev_run.sh
 ```
 
-Apri Swagger:
+Swagger:
 - `http://127.0.0.1:8000/docs`
 
 ## Run via Docker
@@ -44,46 +119,24 @@ docker build -t openclaw-bff .
 docker run --rm -p 8000:8000 --env-file .env openclaw-bff
 ```
 
-## Autenticazione (Keycloak)
+## Auth model
 
-- Se `KEYCLOAK_ENABLED=false` il backend non verifica JWT e usa `DEV_USER_ID` come utente.
-- Se `KEYCLOAK_ENABLED=true`, serve un JWT in `Authorization: Bearer <token>`.
+- `KEYCLOAK_ENABLED=false`: no JWT verification, user derivato da `X-Debug-User` o `DEV_USER_ID`
+- `KEYCLOAK_ENABLED=true`: JWT obbligatorio in `Authorization: Bearer <token>`
 
-> Nota: In produzione **non** bypassare l’auth.
+Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_AUDIENCE`.
 
-## Endpoint principali
+## Sicurezza e isolamento
 
-La API pubblica BFF è sotto `/api/v1`.
+- Ownership check lato DB per conversazioni e uploads sui percorsi `/api/v1/*`.
+- `openclaw_session_key` è gestita dal backend per il routing OpenClaw; il forwarding raw da header client resta disabilitato di default (`ALLOW_RAW_OPENCLAW_SESSION_KEY=false`).
+- Nota implementativa: `POST /api/v1/conversations/{conversation_id}/messages` include attualmente `openclaw_response.session_key` nel payload di risposta (campo diagnostico/compatibilità).
+- Payload e schemi esposti dal BFF usano naming **snake_case** (`conversation_id`, `agent_id`, `client_message_id`, ...).
+- Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF).
 
-- Conversazioni: `/api/v1/conversations`
-- Messaggi: `/api/v1/conversations/{conversationId}/messages` (+ `/stream`)
-- Abort: `/api/v1/conversations/{conversationId}/abort`
-- Inject: `/api/v1/conversations/{conversationId}/inject`
-- Upload: `/api/v1/uploads`
-- Tools: `/api/v1/tools/catalog`, `/api/v1/conversations/{id}/tools/invoke`
+## Script utili
 
-### OpenAI-compat (per OpenWebUI & integrazioni)
-
-Il backend espone anche endpoint compatibili OpenAI:
-
-- `POST /v1/responses`
-- `POST /v1/chat/completions`
-- `POST /tools/invoke`
-- `GET /v1/models`
-
-Questi endpoint **passano sempre dal BFF** e applicano ownership/isolamento sessioni.
-
-## Note di sicurezza
-
-- Il BFF non espone `openclawSessionKey` al FE.
-- Il FE usa `conversationId`; il BFF mappa su `openclawSessionKey` interno.
-- Per compat OpenAI, il campo `user` (o header `x-bff-conversation-id`) viene usato per il routing.
-
-
-
-
-
-##----------------------------------------##
-chmod +x scripts/*.sh
-set -a; source .env; set +a
-##----------------------------------------##
+- `./scripts/start_infra.sh` – avvio container infra
+- `./scripts/init_all.sh` – bootstrap completo infra
+- `./scripts/dev_run.sh` – avvio backend con `.env`
+- `./scripts/run_tests.sh` – avvio suite test

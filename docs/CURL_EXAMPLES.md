@@ -1,34 +1,131 @@
-# cURL examples
+# cURL examples (contratto attuale)
+
+> Esempi in modalità DEV (`KEYCLOAK_ENABLED=false`) con header `X-Debug-User`.
 
 ## Health
+
 ```bash
-curl -s http://localhost:8000/api/v1/health | jq
+curl -s http://localhost:8000/api/v1/health \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Gateway info
+
+```bash
+curl -s http://localhost:8000/api/v1/gateway/info \
+  -H 'X-Debug-User: dev-user' | jq
 ```
 
 ## Create conversation
+
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/conversations \
   -H 'Content-Type: application/json' \
   -H 'X-Debug-User: dev-user' \
-  -d '{"agentId":"main","title":"Demo"}' | jq
+  -d '{"agent_id":"main","title":"Demo"}' | jq
 ```
 
 ## List conversations
+
 ```bash
 curl -s http://localhost:8000/api/v1/conversations \
   -H 'X-Debug-User: dev-user' | jq
 ```
 
-## Stream message (SSE)
+## Send message (non-stream)
+
 ```bash
-curl -N -X POST http://localhost:8000/api/v1/conversations/<id>/messages/stream \
+curl -s -X POST http://localhost:8000/api/v1/conversations/<conversation_id>/messages \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"content":"ciao","client_message_id":"m1"}' | jq
+```
+
+## Stream message (SSE)
+
+```bash
+curl -N -X POST http://localhost:8000/api/v1/conversations/<conversation_id>/messages/stream \
   -H 'Accept: text/event-stream' \
   -H 'Content-Type: application/json' \
   -H 'X-Debug-User: dev-user' \
-  -d '{"content":"ciao","clientMessageId":"m1"}'
+  -d '{"content":"ciao","client_message_id":"m1"}'
 ```
 
-## OpenAI-compat proxy (Chat Completions)
+## Abort run
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/conversations/<conversation_id>/abort \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"run_id":null}' | jq
+```
+
+## Tools catalog
+
+```bash
+curl -s http://localhost:8000/api/v1/tools/catalog \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## List agents
+
+```bash
+curl -s http://localhost:8000/api/v1/agents \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Agent detail
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main?include_files=true" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Update agent
+
+```bash
+curl -s -X PATCH http://localhost:8000/api/v1/agents/main \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"name":"Main Agent","model":"openai:gpt-4.1"}' | jq
+```
+
+## Delete agent
+
+```bash
+curl -s -X DELETE "http://localhost:8000/api/v1/agents/main?delete_files=true" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Invoke tool in conversation
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/conversations/<conversation_id>/tools/invoke \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"tool":"bash","action":null,"args":{"command":"pwd"}}' | jq
+```
+
+## Upload diretto multipart
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/uploads \
+  -H 'X-Debug-User: dev-user' \
+  -F 'file=@./README.md' \
+  -F 'include_presigned_get=true' | jq
+```
+
+## Presign compat flow
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/uploads/presign \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"filename":"doc.txt","mime_type":"text/plain","size_bytes":12}' | jq
+```
+
+## OpenAI-compatible chat completions (stream)
+
 ```bash
 curl -N -X POST http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -36,7 +133,19 @@ curl -N -X POST http://localhost:8000/v1/chat/completions \
   -d '{
     "model":"openclaw:main",
     "messages":[{"role":"user","content":"ciao"}],
-    "stream": true,
-    "user":"dev-user"
+    "stream": true
   }'
+```
+
+## OpenAI-compatible responses (non-stream)
+
+```bash
+curl -s -X POST http://localhost:8000/v1/responses \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{
+    "model":"openclaw:main",
+    "input":"Ciao, fammi un riepilogo",
+    "stream": false
+  }' | jq
 ```

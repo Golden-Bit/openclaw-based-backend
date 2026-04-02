@@ -1,17 +1,99 @@
 # Troubleshooting
 
-## Keycloak: token non valido
-- assicurati di aver eseguito `./scripts/init_keycloak.sh`
-- verifica realm e client su http://localhost:8080 (admin/admin)
+## 401 / 403 su endpoint API
 
-## MinIO: bucket mancante
-- esegui `./scripts/init_minio.sh`
-- controlla console: http://localhost:9001
+### Causa comune
+- `KEYCLOAK_ENABLED=true` ma token mancante/non valido
 
-## Postgres: permission denied
-- esegui `./scripts/init_db.sh`
-- verifica che `.env` punti a `localhost:5432`
+### Verifica
+- `Authorization: Bearer <token>` presente
+- `KEYCLOAK_JWKS_URL` raggiungibile
+- `KEYCLOAK_ISSUER` e `KEYCLOAK_AUDIENCE` coerenti col realm/client
 
-## OpenClaw non raggiungibile
-- i test che dipendono da OpenClaw vengono skippati
-- verifica `OPENCLAW_HTTP_BASE` e che OpenClaw sia attivo sull’host
+### Fix
+- in locale rapido: imposta `KEYCLOAK_ENABLED=false` e usa `X-Debug-User`
+
+---
+
+## Health ok=false con db_ok=false
+
+### Causa
+- connessione DB errata o ruolo/db non inizializzati
+
+### Verifica/Fix
+- controlla `DATABASE_URL`
+- esegui `./scripts/init_db.sh` (o `./scripts/init_all.sh`)
+
+---
+
+## Health ok=false con openclaw_ws_ok=false
+
+### Causa
+- OpenClaw WS non raggiungibile
+- handshake challenge/signature fallita
+
+### Verifica
+- `OPENCLAW_WS_URL` corretto
+- `OPENCLAW_BEARER_TOKEN` valido (se richiesto)
+- `OPENCLAW_IDENTITY_FILE` esistente e leggibile
+
+### Debug utile
+- `OPENCLAW_WS_DEBUG=1`
+- `OPENCLAW_WS_DEBUG_PAYLOAD=1`
+- `OPENCLAW_WS_DEBUG_EVENTS=chat,agent`
+
+---
+
+## 502 su /v1/* o /tools/invoke
+
+### Causa
+- errore upstream OpenClaw
+
+### Verifica/Fix
+- controlla `OPENCLAW_HTTP_BASE`
+- verifica policy/permessi agent e tool lato gateway
+- leggi `detail` restituito dal BFF (mappa `OpenClawHTTPError`)
+
+---
+
+## 503 su `/api/v1/agents/{agent_id}` in PATCH/DELETE
+
+### Causa
+- scope WS insufficienti verso OpenClaw (`operator.admin` richiesto da gateway)
+
+### Verifica/Fix
+- controlla `OPENCLAW_SCOPES` lato BFF/gateway token
+- verifica che il token usato dal gateway includa scope admin necessari
+- prova `GET /api/v1/agents` (read scope) per distinguere problema auth da raggiungibilità
+
+---
+
+## MinIO error: "path in endpoint is not allowed"
+
+### Causa
+- endpoint MinIO configurato con schema/path
+
+### Fix
+- usa `MINIO_ENDPOINT=host:port` (es. `localhost:9000`)
+- non usare `http://` in `MINIO_ENDPOINT`
+
+---
+
+## Upload fallisce con 413
+
+### Causa
+- file oltre soglia `UPLOAD_MAX_BYTES`
+
+### Fix
+- riduci dimensione file o aumenta `UPLOAD_MAX_BYTES`
+
+---
+
+## Test che falliscono con campi/shape inattesi
+
+### Causa
+- alcuni test/documenti legacy usano contratti camelCase o shape vecchi
+
+### Stato attuale
+- API BFF espone prevalentemente payload snake_case (`conversation_id`, `agent_id`, `client_message_id`, ...)
+- endpoint upload principale (`POST /api/v1/uploads`) è upload diretto multipart, non presign-only
