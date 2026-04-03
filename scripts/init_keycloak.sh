@@ -4,7 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-KC_BASE="${KEYCLOAK_BASE_URL:-http://localhost:8080}"
+# Load .env when script is invoked directly.
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+
+KC_BASE_INTERNAL="${KEYCLOAK_INTERNAL_URL:-${KEYCLOAK_BASE_URL:-http://localhost:8080}}"
+KC_BASE_PUBLIC="${KEYCLOAK_PUBLIC_URL:-${KEYCLOAK_BASE_URL:-http://localhost:8080}}"
+KC_BASE="$KC_BASE_INTERNAL"
 KC_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
 KC_ADMIN_PASS="${KEYCLOAK_ADMIN_PASSWORD:-admin}"
 
@@ -13,6 +22,16 @@ CLIENT_ID="${KEYCLOAK_CLIENT_ID:-openclaw-bff-api}"
 
 TEST_USER="${KEYCLOAK_TEST_USER:-testuser}"
 TEST_PASS="${KEYCLOAK_TEST_PASSWORD:-testpassword}"
+
+PUBLIC_ORIGIN="$(python3 - "$KC_BASE_PUBLIC" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+u = urlparse(sys.argv[1])
+origin = f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else "http://localhost:8080"
+print(origin)
+PY
+)"
 
 echo "Waiting Keycloak..."
 "$ROOT_DIR/scripts/wait_for_http.sh" "$KC_BASE/realms/master" 180
@@ -154,8 +173,8 @@ if [[ -z "$client_uuid" ]]; then
   "standardFlowEnabled": true,
   "directAccessGrantsEnabled": true,
   "serviceAccountsEnabled": false,
-  "redirectUris": ["http://localhost:*/*"],
-  "webOrigins": ["http://localhost:*"]
+  "redirectUris": ["$PUBLIC_ORIGIN/*", "http://localhost:*/*"],
+  "webOrigins": ["$PUBLIC_ORIGIN", "http://localhost:*"]
 }
 JSON
 )" >/dev/null
@@ -217,3 +236,5 @@ echo "Keycloak initialized."
 echo "Realm: $REALM"
 echo "ClientId: $CLIENT_ID"
 echo "Test user: $TEST_USER / $TEST_PASS"
+echo "Internal URL used for bootstrap: $KC_BASE_INTERNAL"
+echo "Public URL configured: $KC_BASE_PUBLIC"

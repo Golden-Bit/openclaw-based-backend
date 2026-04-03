@@ -20,6 +20,14 @@ Verifica almeno:
 - `OPENCLAW_IDENTITY_FILE` (consigliato: identity del client OpenClaw esistente)
 - `OPENCLAW_STATE_DIR` (fallback per identity locale generata)
 - `KEYCLOAK_ENABLED`
+- `KEYCLOAK_PUBLIC_URL` (dominio pubblico Keycloak, anche https)
+- `KEYCLOAK_INTERNAL_URL` (URL usato da script bootstrap)
+- `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`, `KEYCLOAK_AUDIENCE`
+
+Per Keycloak dietro reverse proxy:
+- `KC_HOSTNAME` coerente con `KEYCLOAK_PUBLIC_URL`
+- `KC_HTTP_ENABLED=true` se la TLS è terminata al proxy
+- `KC_PROXY_HEADERS=xforwarded` (o `forwarded` in base al proxy)
 
 ## 2) Avvio infrastruttura
 

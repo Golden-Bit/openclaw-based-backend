@@ -107,6 +107,9 @@ Aggiorna almeno:
 - `OPENCLAW_IDENTITY_FILE` (consigliato, identity device del client OpenClaw)
 - `OPENCLAW_STATE_DIR` (fallback per identity locale generata dal BFF)
 - `KEYCLOAK_ENABLED`
+- `KEYCLOAK_PUBLIC_URL` (dominio pubblico Keycloak: http/https)
+- `KEYCLOAK_INTERNAL_URL` (URL interno usato da script bootstrap)
+- `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`, `KEYCLOAK_AUDIENCE` (coerenti con realm/client)
 
 ### 2) Infra locale (Postgres/MinIO/Keycloak)
 
@@ -139,6 +142,11 @@ docker run --rm -p 8000:8000 --env-file .env openclaw-bff
 - `KEYCLOAK_ENABLED=true`: JWT obbligatorio in `Authorization: Bearer <token>`
 
 Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_AUDIENCE`.
+
+Per deployment dietro dominio/proxy:
+- imposta `KEYCLOAK_PUBLIC_URL` al dominio esterno (es. `https://auth.example.com`)
+- imposta `KC_HOSTNAME` coerente al public URL
+- se usi edge TLS termination, usa `KC_HTTP_ENABLED=true` e `KC_PROXY_HEADERS=xforwarded|forwarded`.
 
 ## Sicurezza e isolamento
 

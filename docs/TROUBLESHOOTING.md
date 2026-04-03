@@ -9,9 +9,30 @@
 - `Authorization: Bearer <token>` presente
 - `KEYCLOAK_JWKS_URL` raggiungibile
 - `KEYCLOAK_ISSUER` e `KEYCLOAK_AUDIENCE` coerenti col realm/client
+- coerenza tra `KEYCLOAK_PUBLIC_URL` e issuer/jwks configurati
 
 ### Fix
 - in locale rapido: imposta `KEYCLOAK_ENABLED=false` e usa `X-Debug-User`
+
+---
+
+## Keycloak su dominio HTTPS non funziona correttamente dietro proxy
+
+### Causa comune
+- `KC_HOSTNAME` non coerente con dominio pubblico
+- `KC_PROXY_HEADERS` non impostato
+- `KEYCLOAK_PUBLIC_URL` non allineato con issuer/jwks usati dal backend
+
+### Verifica
+- `KEYCLOAK_PUBLIC_URL` = URL pubblico reale (es. `https://auth.example.com`)
+- `KEYCLOAK_ISSUER=${KEYCLOAK_PUBLIC_URL}/realms/<realm>`
+- `KEYCLOAK_JWKS_URL=${KEYCLOAK_PUBLIC_URL}/realms/<realm>/protocol/openid-connect/certs`
+- Keycloak runtime: `KC_HOSTNAME`, `KC_PROXY_HEADERS`, `KC_HTTP_ENABLED`
+
+### Fix
+- con edge TLS termination usa `KC_HTTP_ENABLED=true`
+- imposta `KC_PROXY_HEADERS=xforwarded` (o `forwarded`)
+- se necessario abilita temporaneamente `KC_HOSTNAME_STRICT=false` in dev
 
 ---
 

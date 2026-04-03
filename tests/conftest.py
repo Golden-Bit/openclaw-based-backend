@@ -5,7 +5,11 @@ import httpx
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 KEYCLOAK_ENABLED = os.getenv("KEYCLOAK_ENABLED", "false").lower() == "true"
 
-KC_BASE = os.getenv("KEYCLOAK_BASE_URL", "http://localhost:8080")
+KC_BASE = (
+    os.getenv("KEYCLOAK_INTERNAL_URL")
+    or os.getenv("KEYCLOAK_BASE_URL")
+    or "http://localhost:8080"
+)
 KC_REALM = os.getenv("KEYCLOAK_REALM", "openclaw-bff")
 KC_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "openclaw-bff-api")
 KC_TEST_USER = os.getenv("KEYCLOAK_TEST_USER", "testuser")
@@ -29,7 +33,7 @@ def _get_token() -> str:
 
 
 @pytest.fixture(scope="session")
-def auth_headers() -> dict:
+def auth_headers() -> dict[str, str]:
     if not KEYCLOAK_ENABLED:
         return {"X-Debug-User": DEBUG_USER}
     token = _get_token()
