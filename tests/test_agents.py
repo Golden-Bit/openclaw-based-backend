@@ -41,6 +41,19 @@ def _patch_ws(monkeypatch: MonkeyPatch, ws: _FakeWS):
     monkeypatch.setattr(agents_endpoint, "_get_connected_ws", _get_connected_ws)
 
 
+def _patch_skill_bootstrap(monkeypatch: MonkeyPatch, *, fail: bool = False):
+    calls: list[tuple[str, str]] = []
+
+    def _ensure_share_skill_for_agent(workspace: str, *, user_id: str):
+        calls.append((workspace, user_id))
+        if fail:
+            raise RuntimeError("bootstrap failed")
+        return Path(workspace) / "skills" / "share-files" / "SKILL.md"
+
+    monkeypatch.setattr(agents_endpoint, "ensure_share_skill_for_agent", _ensure_share_skill_for_agent)
+    return calls
+
+
 def _user(uid: str = "u1") -> AuthenticatedUser:
     return AuthenticatedUser(user_id=uid, claims={})
 
@@ -124,6 +137,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
     expected_ws = normalize_workspace_for_user("u1", "a1")
     ws = _FakeWS(responses={"agents.create": {"ok": True, "agentId": "a-1", "name": "Agent 1", "workspace": "/tmp/a1"}})
     _patch_ws(monkeypatch, ws)
+    skill_calls = _patch_skill_bootstrap(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -146,6 +160,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
             },
         )
     ]
+    assert skill_calls == [("/tmp/a1", "u1")]
 
 
 def test_create_agent_rejects_empty_workspace(monkeypatch: MonkeyPatch):
@@ -161,6 +176,29 @@ def test_create_agent_rejects_empty_workspace(monkeypatch: MonkeyPatch):
         )
 
     assert exc_info.value.status_code == 400
+
+
+def test_create_agent_rolls_back_when_skill_bootstrap_fails(monkeypatch: MonkeyPatch):
+    ws = _FakeWS(
+        responses={
+            "agents.create": {"ok": True, "agentId": "a-2", "name": "Agent 2", "workspace": normalize_workspace_for_user("u1", "a2")},
+            "agents.delete": {"ok": True},
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+    _ = _patch_skill_bootstrap(monkeypatch, fail=True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            agents_endpoint.create_agent(
+                AgentCreateRequest(name="Agent 2", workspace="a2"),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert ws.calls[0][0] == "agents.create"
+    assert ws.calls[1] == ("agents.delete", {"agentId": "a-2", "deleteFiles": True})
 
 
 def test_create_agent_rejects_foreign_absolute_workspace(monkeypatch: MonkeyPatch):
