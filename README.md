@@ -143,6 +143,10 @@ docker run --rm -p 8000:8000 --env-file .env openclaw-bff
 
 Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `KEYCLOAK_AUDIENCE`.
 
+Per isolamento agenti/knowledge senza DB ownership dedicato:
+- `AGENT_WORKSPACE_ROOT` definisce la root filesystem di namespace utente (derivato da `user_id` JWT)
+- ogni workspace agente deve ricadere nel namespace utente, altrimenti l'agente non è visibile/modificabile.
+
 Per deployment dietro dominio/proxy:
 - imposta `KEYCLOAK_PUBLIC_URL` al dominio esterno (es. `https://auth.example.com`)
 - imposta `KC_HOSTNAME` coerente al public URL
@@ -154,9 +158,9 @@ Per deployment dietro dominio/proxy:
 - `openclaw_session_key` è gestita dal backend per il routing OpenClaw; il forwarding raw da header client resta disabilitato di default (`ALLOW_RAW_OPENCLAW_SESSION_KEY=false`).
 - Nota implementativa: `POST /api/v1/conversations/{conversation_id}/messages` include attualmente `openclaw_response.session_key` nel payload di risposta (campo diagnostico/compatibilità).
 - Payload e schemi esposti dal BFF usano naming **snake_case** (`conversation_id`, `agent_id`, `client_message_id`, ...).
-- Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF).
+- Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF) e applicano isolamento per utente via namespace workspace (`AGENT_WORKSPACE_ROOT`).
 - In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
-- Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e non usano MinIO.
+- Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e visibilità limitata agli agenti nel namespace workspace dell'utente autenticato.
 
 ## Script utili
 

@@ -19,6 +19,8 @@ Verifica almeno:
 - `OPENCLAW_BEARER_TOKEN` (se richiesto)
 - `OPENCLAW_IDENTITY_FILE` (consigliato: identity del client OpenClaw esistente)
 - `OPENCLAW_STATE_DIR` (fallback per identity locale generata)
+- `OPENCLAW_DEFAULT_AGENT_ID`
+- `AGENT_WORKSPACE_ROOT` (root namespace utenti per isolamento agenti/knowledge)
 - `KEYCLOAK_ENABLED`
 - `KEYCLOAK_PUBLIC_URL` (dominio pubblico Keycloak, anche https)
 - `KEYCLOAK_INTERNAL_URL` (URL usato da script bootstrap)

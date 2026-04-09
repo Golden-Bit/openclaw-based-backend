@@ -154,3 +154,16 @@
 ### Verifica/Fix
 - abilita `overwrite=true` per endpoint upload
 - usa `upsert=true` su `PUT /files` quando vuoi creare se assente
+
+---
+
+## `404` su agent/knowledge dopo login con utente diverso
+
+### Causa
+- isolamento no-DB basato su namespace workspace utente (`AGENT_WORKSPACE_ROOT`)
+- l'agente esiste in OpenClaw ma il suo `workspace` non ricade nel namespace dell'utente corrente
+
+### Verifica/Fix
+- controlla `AGENT_WORKSPACE_ROOT` nel backend
+- crea/aggiorna agenti con workspace sotto la root namespace utente corrente
+- evita di condividere manualmente workspace cross-user se non previsto
