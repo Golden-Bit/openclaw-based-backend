@@ -165,5 +165,21 @@
 
 ### Verifica/Fix
 - controlla `AGENT_WORKSPACE_ROOT` nel backend
+- verifica `AGENT_NAMESPACE_SALT` coerente (se cambia, cambia anche il namespace hash-only)
+- usa `AGENT_NAMESPACE_ALLOW_LEGACY=true` durante migrazione da namespace vecchi
 - crea/aggiorna agenti con workspace sotto la root namespace utente corrente
 - evita di condividere manualmente workspace cross-user se non previsto
+
+---
+
+## `404` su `/shared/files/...`
+
+### Causa
+- file non esiste sotto `SHARED_FILES_ROOT`
+- path invalido/traversal (`..`, assoluto, segmenti non validi)
+- URL usa prefisso diverso da `SHARED_FILES_URL_PREFIX`
+
+### Verifica/Fix
+- verifica `SHARED_FILES_ROOT` e che il file sia realmente presente
+- usa path relativo valido dopo il prefisso, es: `/shared/files/user-x/report.pdf`
+- controlla `SHARED_FILES_URL_PREFIX` e riavvia backend dopo modifica env

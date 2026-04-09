@@ -62,6 +62,9 @@ Il servizio integra:
 - `GET /api/v1/agents/{agent_id}/knowledge/files/download`
 - `POST /api/v1/agents/{agent_id}/knowledge/reindex`
 
+#### Shared File Hosting
+- `GET /shared/files/{path}` (public hosting da filesystem backend)
+
 #### Uploads
 - `POST /api/v1/uploads` (multipart upload diretto)
 - `POST /api/v1/uploads/bytes`
@@ -146,6 +149,12 @@ Per Keycloak mode sono rilevanti anche `KEYCLOAK_JWKS_URL`, `KEYCLOAK_ISSUER`, `
 Per isolamento agenti/knowledge senza DB ownership dedicato:
 - `AGENT_WORKSPACE_ROOT` definisce la root filesystem di namespace utente (derivato da `user_id` JWT)
 - ogni workspace agente deve ricadere nel namespace utente, altrimenti l'agente non è visibile/modificabile.
+- `AGENT_NAMESPACE_SALT` stabilizza namespace hash-only e riduce deducibilità dei path utente.
+- `AGENT_NAMESPACE_ALLOW_LEGACY=true` mantiene compatibilità con namespace legacy slug+hash (migrazione graduale).
+
+Per hosting file condivisi via browser:
+- `SHARED_FILES_ROOT` directory root servita dal backend
+- `SHARED_FILES_URL_PREFIX` prefisso URL pubblico (default `/shared/files`)
 
 Per deployment dietro dominio/proxy:
 - imposta `KEYCLOAK_PUBLIC_URL` al dominio esterno (es. `https://auth.example.com`)
@@ -159,8 +168,10 @@ Per deployment dietro dominio/proxy:
 - Nota implementativa: `POST /api/v1/conversations/{conversation_id}/messages` include attualmente `openclaw_response.session_key` nel payload di risposta (campo diagnostico/compatibilità).
 - Payload e schemi esposti dal BFF usano naming **snake_case** (`conversation_id`, `agent_id`, `client_message_id`, ...).
 - Endpoint agenti (`/api/v1/agents/*`) leggono/modificano lo stato persistito in OpenClaw via WS RPC (nessun DB locale agenti nel BFF) e applicano isolamento per utente via namespace workspace (`AGENT_WORKSPACE_ROOT`).
+- Namespace utente per workspace è hash-only (`u-<hash>`), con fallback legacy opzionale controllato da `AGENT_NAMESPACE_ALLOW_LEGACY`.
 - In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
 - Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e visibilità limitata agli agenti nel namespace workspace dell'utente autenticato.
+- Rotta shared hosting serve file da `SHARED_FILES_ROOT` (supporta sottocartelle), senza listing directory e con blocco traversal/symlink.
 
 ## Script utili
 
