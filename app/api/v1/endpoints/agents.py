@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.agent_ownership import is_workspace_owned_by_user, normalize_workspace_for_user
+from app.core.agent_share_skill import ensure_share_skill_for_agent
 from app.core.config import settings
 from app.core.openclaw_ws import OpenClawWSClient
 from app.core.security import AuthenticatedUser, get_current_user
@@ -206,6 +207,32 @@ async def create_agent(
         rworkspace = res.get("workspace")
         if isinstance(rworkspace, str) and rworkspace.strip():
             result_workspace = rworkspace.strip()
+
+    effective_workspace = result_workspace or workspace
+
+    try:
+        _ = ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)
+    except Exception as skill_err:  # noqa: BLE001
+        rollback_error: Optional[Exception] = None
+        if agent_id:
+            try:
+                _ = await ws.call("agents.delete", {"agentId": agent_id, "deleteFiles": True})
+            except Exception as e:  # noqa: BLE001
+                rollback_error = e
+
+        if rollback_error is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Agent created but share skill bootstrap failed; create was rolled back: {skill_err}",
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Agent created but share skill bootstrap failed and rollback failed: "
+                f"bootstrap_error={skill_err}; rollback_error={rollback_error}"
+            ),
+        )
 
     return AgentCreateResponse(
         created=True,

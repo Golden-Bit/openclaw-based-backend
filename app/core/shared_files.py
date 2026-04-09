@@ -20,6 +20,14 @@ def ensure_shared_files_root() -> Path:
     return root
 
 
+def normalize_shared_url_prefix(raw_prefix: str | None) -> str:
+    raw = (raw_prefix or "").strip() or "/shared/files"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    raw = raw.rstrip("/")
+    return raw or "/shared/files"
+
+
 def normalize_shared_relative_path(raw_path: str) -> str:
     decoded = unquote((raw_path or "").strip()).replace("\\", "/")
     if not decoded:

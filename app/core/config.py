@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     # Shared files hosting
     shared_files_root: str = Field(default="/tmp/openclaw-bff/shared-files", alias="SHARED_FILES_ROOT")
     shared_files_url_prefix: str = Field(default="/shared/files", alias="SHARED_FILES_URL_PREFIX")
+    bff_public_base_url: str = Field(default="http://localhost:8000", alias="BFF_PUBLIC_BASE_URL")
 
     # Keycloak
     keycloak_enabled: bool = Field(default=False, alias="KEYCLOAK_ENABLED")

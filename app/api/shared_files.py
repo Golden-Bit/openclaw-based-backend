@@ -6,15 +6,11 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from app.core.config import settings
-from app.core.shared_files import SharedFilePathError, resolve_shared_file_path
+from app.core.shared_files import SharedFilePathError, normalize_shared_url_prefix, resolve_shared_file_path
 
 
 def _shared_prefix() -> str:
-    raw = (settings.shared_files_url_prefix or "").strip() or "/shared/files"
-    if not raw.startswith("/"):
-        raw = "/" + raw
-    raw = raw.rstrip("/")
-    return raw or "/shared/files"
+    return normalize_shared_url_prefix(settings.shared_files_url_prefix)
 
 
 router = APIRouter(prefix=_shared_prefix())
