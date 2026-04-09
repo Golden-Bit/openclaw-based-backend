@@ -76,11 +76,13 @@ curl -s http://localhost:8000/api/v1/agents \
 
 ## Create agent
 
+> Nota: `workspace` deve essere relativo; il backend lo normalizza automaticamente sotto il namespace workspace dell'utente.
+
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/agents \
   -H 'Content-Type: application/json' \
   -H 'X-Debug-User: dev-user' \
-  -d '{"name":"Support Agent","workspace":"/tmp/support-agent","emoji":"🤖"}' | jq
+  -d '{"name":"Support Agent","workspace":"support-agent","emoji":"🤖"}' | jq
 ```
 
 ## Agent detail
