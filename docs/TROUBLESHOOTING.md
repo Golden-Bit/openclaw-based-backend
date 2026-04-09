@@ -183,3 +183,16 @@
 - verifica `SHARED_FILES_ROOT` e che il file sia realmente presente
 - usa path relativo valido dopo il prefisso, es: `/shared/files/user-x/report.pdf`
 - controlla `SHARED_FILES_URL_PREFIX` e riavvia backend dopo modifica env
+
+---
+
+## `500` in creazione agente con messaggio su "share skill bootstrap failed"
+
+### Causa
+- il backend non riesce a creare `skills/share-files/SKILL.md` nel workspace agente
+- tipicamente permessi filesystem o path workspace non scrivibile
+
+### Verifica/Fix
+- verifica permessi write sul workspace agente
+- verifica `SHARED_FILES_ROOT`, `SHARED_FILES_URL_PREFIX`, `BFF_PUBLIC_BASE_URL`
+- se necessario crea manualmente `skills/share-files/` nel workspace e riprova

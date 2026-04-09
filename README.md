@@ -155,6 +155,7 @@ Per isolamento agenti/knowledge senza DB ownership dedicato:
 Per hosting file condivisi via browser:
 - `SHARED_FILES_ROOT` directory root servita dal backend
 - `SHARED_FILES_URL_PREFIX` prefisso URL pubblico (default `/shared/files`)
+- `BFF_PUBLIC_BASE_URL` base URL assoluta usata nella skill auto-generata (es. `https://api.example.com`)
 
 Per deployment dietro dominio/proxy:
 - imposta `KEYCLOAK_PUBLIC_URL` al dominio esterno (es. `https://auth.example.com`)
@@ -172,6 +173,7 @@ Per deployment dietro dominio/proxy:
 - In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
 - Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e visibilità limitata agli agenti nel namespace workspace dell'utente autenticato.
 - Rotta shared hosting serve file da `SHARED_FILES_ROOT` (supporta sottocartelle), senza listing directory e con blocco traversal/symlink.
+- Quando crei un agente, il backend crea automaticamente `skills/share-files/SKILL.md` nel workspace agente con istruzioni su path condiviso e formato link markdown da usare in chat.
 
 ## Script utili
 

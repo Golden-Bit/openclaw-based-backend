@@ -25,6 +25,7 @@ Verifica almeno:
 - `AGENT_NAMESPACE_ALLOW_LEGACY` (compatibilità con namespace legacy)
 - `SHARED_FILES_ROOT` (directory file hosting pubblico)
 - `SHARED_FILES_URL_PREFIX` (prefisso URL per download da browser)
+- `BFF_PUBLIC_BASE_URL` (base URL assoluta usata nella skill share-files)
 - `KEYCLOAK_ENABLED`
 - `KEYCLOAK_PUBLIC_URL` (dominio pubblico Keycloak, anche https)
 - `KEYCLOAK_INTERNAL_URL` (URL usato da script bootstrap)
@@ -73,6 +74,8 @@ Endpoint utili:
 - Agents list: `http://localhost:8000/api/v1/agents`
 - Agent knowledge tree: `http://localhost:8000/api/v1/agents/main/knowledge/tree`
 - Shared hosted file (esempio): `http://localhost:8000/shared/files/public/example.txt`
+
+Nota: alla creazione agente, il backend scrive automaticamente `skills/share-files/SKILL.md` nel workspace agente.
 
 ## 5) Test
 
