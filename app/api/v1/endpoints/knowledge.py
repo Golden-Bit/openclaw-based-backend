@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse
 
 from app.api.v1.endpoints import agents as agents_endpoint
+from app.core.agent_ownership import is_workspace_owned_by_user
 from app.core.config import settings
 from app.core.knowledge_fs import (
     KnowledgePathError,
@@ -112,7 +113,7 @@ async def _resolve_agent_workspace(ws, agent_id: str) -> str:
     return workspace_raw.strip()
 
 
-async def _agent_context(agent_id: str):
+async def _agent_context(agent_id: str, user: AuthenticatedUser):
     aid = (agent_id or "").strip()
     if not aid:
         raise HTTPException(status_code=400, detail="agent_id is required")
@@ -122,6 +123,8 @@ async def _agent_context(agent_id: str):
     workspace_path = Path(workspace).expanduser()
     if not workspace_path.is_absolute():
         raise HTTPException(status_code=409, detail=f"Agent '{aid}' workspace must be an absolute path")
+    if not is_workspace_owned_by_user(user.user_id, workspace):
+        raise HTTPException(status_code=404, detail=f"Agent '{aid}' not found")
     root = knowledge_root_for_workspace(workspace)
     ensure_root_dir(root)
     return aid, ws, workspace, root
@@ -179,9 +182,9 @@ def _iter_tree(root: Path, base: Path) -> list[KnowledgeTreeItem]:
 async def knowledge_tree(
     agent_id: str,
     path: str = Query(default="", description="Path relativa dentro memory/knowledge"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeTreeResponse:
-    aid, _ws, workspace, root = await _agent_context(agent_id)
+    aid, _ws, workspace, root = await _agent_context(agent_id, user)
     try:
         rel, base = _resolve_folder(root, path, allow_empty=True)
         if not base.exists():
@@ -207,9 +210,9 @@ async def knowledge_tree(
 async def create_folder(
     agent_id: str,
     body: KnowledgeFolderCreateRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFolderMutationResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_folder(root, body.path, allow_empty=False)
         if target.exists() and not target.is_dir():
@@ -227,9 +230,9 @@ async def create_folder(
 async def move_folder(
     agent_id: str,
     body: KnowledgeFolderMoveRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFolderMutationResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         from_rel, src = _resolve_folder(root, body.from_path, allow_empty=False)
         to_rel, dst = _resolve_folder(root, body.to_path, allow_empty=False)
@@ -256,9 +259,9 @@ async def delete_folder(
     agent_id: str,
     path: str = Query(..., description="Path relativa cartella"),
     recursive: bool = Query(default=True),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFolderDeleteResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_folder(root, path, allow_empty=False)
         if not target.exists() or not target.is_dir():
@@ -301,9 +304,9 @@ async def upload_file(
     path: str = Form(default="", description="Path relativa cartella destinazione"),
     filename: str | None = Form(default=None, description="Filename opzionale override"),
     overwrite: bool = Form(default=False),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFileMutationResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         folder_rel = normalize_relative_path(path, allow_empty=True)
         final_name = _sanitize_filename(filename or file.filename or "")
@@ -335,9 +338,9 @@ async def upload_file(
 async def upload_file_base64(
     agent_id: str,
     body: KnowledgeFileBase64UploadRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFileMutationResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         folder_rel = normalize_relative_path(body.path, allow_empty=True)
         final_name = _sanitize_filename(body.filename)
@@ -371,9 +374,9 @@ async def upload_file_base64(
 async def replace_file(
     agent_id: str,
     body: KnowledgeFilePutRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFileMutationResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_file(root, body.path)
         validate_allowed_extension(target.name, ALLOWED_EXTENSIONS)
@@ -403,9 +406,9 @@ async def replace_file(
 async def delete_file(
     agent_id: str,
     path: str = Query(..., description="Path relativa file"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFileDeleteResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_file(root, path)
         if not target.exists() or not target.is_file():
@@ -421,9 +424,9 @@ async def delete_file(
 async def read_file_content(
     agent_id: str,
     path: str = Query(..., description="Path relativa file"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeFileContentResponse:
-    aid, _ws, _workspace, root = await _agent_context(agent_id)
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_file(root, path)
         if not target.exists() or not target.is_file():
@@ -460,9 +463,9 @@ async def read_file_content(
 async def download_file(
     agent_id: str,
     path: str = Query(..., description="Path relativa file"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> FileResponse:
-    _aid, _ws, _workspace, root = await _agent_context(agent_id)
+    _aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         _rel, target = _resolve_file(root, path)
         if not target.exists() or not target.is_file():
@@ -483,9 +486,9 @@ async def download_file(
 )
 async def reindex_knowledge(
     agent_id: str,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> KnowledgeReindexResponse:
-    aid, ws, _workspace, _root = await _agent_context(agent_id)
+    aid, ws, _workspace, _root = await _agent_context(agent_id, user)
 
     warnings: list[str] = []
     details: dict[str, Any] | None = None

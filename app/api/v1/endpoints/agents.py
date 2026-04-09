@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.core.agent_ownership import is_workspace_owned_by_user, normalize_workspace_for_user
 from app.core.config import settings
 from app.core.openclaw_ws import OpenClawWSClient
 from app.core.security import AuthenticatedUser, get_current_user
@@ -106,6 +107,41 @@ def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> A
     )
 
 
+def _workspace_from_raw_agent(raw: Dict[str, Any]) -> Optional[str]:
+    workspace = raw.get("workspace")
+    if isinstance(workspace, str) and workspace.strip():
+        return workspace.strip()
+    return None
+
+
+def _enforce_agent_ownership_or_404(user: AuthenticatedUser, raw_agent: Dict[str, Any], *, requested_agent_id: str) -> str:
+    workspace = _workspace_from_raw_agent(raw_agent)
+    if not is_workspace_owned_by_user(user.user_id, workspace):
+        raise HTTPException(status_code=404, detail=f"Agent '{requested_agent_id}' not found")
+    return workspace or ""
+
+
+async def _get_owned_agent_or_404(ws, user: AuthenticatedUser, agent_id: str) -> Dict[str, Any]:
+    try:
+        list_payload = await ws.call("agents.list", {})
+    except Exception as e:  # noqa: BLE001
+        raise _map_ws_error("agents.list", e, not_found_agent_id=agent_id)
+
+    if not isinstance(list_payload, dict):
+        raise HTTPException(status_code=502, detail=f"Unexpected OpenClaw payload for agents.list: {list_payload!r}")
+
+    raw_agents = list_payload.get("agents")
+    if not isinstance(raw_agents, list):
+        raw_agents = []
+
+    selected = _find_agent(raw_agents, agent_id)
+    if selected is None:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    _enforce_agent_ownership_or_404(user, selected, requested_agent_id=agent_id)
+    return selected
+
+
 @router.post(
     "",
     summary="Crea agente OpenClaw",
@@ -113,15 +149,22 @@ def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> A
 )
 async def create_agent(
     body: AgentCreateRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentCreateResponse:
     name = body.name.strip()
-    workspace = body.workspace.strip()
+    workspace_input = body.workspace.strip()
 
     if not name:
         raise HTTPException(status_code=400, detail="name cannot be empty")
-    if not workspace:
+    if not workspace_input:
         raise HTTPException(status_code=400, detail="workspace cannot be empty")
+
+    try:
+        workspace = normalize_workspace_for_user(user.user_id, workspace_input)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
 
     params: Dict[str, Any] = {
         "name": name,
@@ -192,7 +235,7 @@ def _find_agent(raw_agents: list[Any], agent_id: str) -> Optional[Dict[str, Any]
     response_model=AgentListResponse,
 )
 async def list_agents(
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentListResponse:
     ws = await _get_connected_ws()
 
@@ -212,11 +255,13 @@ async def list_agents(
     if not isinstance(raw_agents, list):
         raw_agents = []
 
-    items = [
-        _normalize_agent_summary(agent, default_agent_id=default_agent_id)
-        for agent in raw_agents
-        if isinstance(agent, dict)
-    ]
+    items: list[AgentSummary] = []
+    for agent in raw_agents:
+        if not isinstance(agent, dict):
+            continue
+        if not is_workspace_owned_by_user(user.user_id, _workspace_from_raw_agent(agent)):
+            continue
+        items.append(_normalize_agent_summary(agent, default_agent_id=default_agent_id))
 
     return AgentListResponse(
         default_agent_id=default_agent_id,
@@ -234,7 +279,7 @@ async def list_agents(
 async def get_agent(
     agent_id: str,
     include_files: bool = Query(default=False, description="Se true include agents.files.list"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentDetailResponse:
     agent_id = (agent_id or "").strip()
     if not agent_id:
@@ -257,6 +302,8 @@ async def get_agent(
     selected = _find_agent(raw_agents, agent_id)
     if selected is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    _enforce_agent_ownership_or_404(user, selected, requested_agent_id=agent_id)
 
     default_agent_id = str(list_payload.get("defaultId") or settings.openclaw_default_agent_id)
     summary = _normalize_agent_summary(selected, default_agent_id=default_agent_id)
@@ -325,11 +372,14 @@ async def get_agent(
 async def update_agent(
     agent_id: str,
     body: AgentUpdateRequest,
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentUpdateResponse:
     agent_id = (agent_id or "").strip()
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id is required")
+
+    ws = await _get_connected_ws()
+    _ = await _get_owned_agent_or_404(ws, user, agent_id)
 
     params: Dict[str, Any] = {"agentId": agent_id}
 
@@ -340,9 +390,15 @@ async def update_agent(
         params["name"] = name
 
     if body.workspace is not None:
-        workspace = body.workspace.strip()
-        if not workspace:
+        workspace_input = body.workspace.strip()
+        if not workspace_input:
             raise HTTPException(status_code=400, detail="workspace cannot be empty")
+        try:
+            workspace = normalize_workspace_for_user(user.user_id, workspace_input)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except PermissionError as e:
+            raise HTTPException(status_code=403, detail=str(e))
         params["workspace"] = workspace
 
     if body.model is not None:
@@ -359,8 +415,6 @@ async def update_agent(
 
     if len(params) == 1:
         raise HTTPException(status_code=400, detail="At least one field among name/workspace/model/avatar is required")
-
-    ws = await _get_connected_ws()
 
     try:
         res = await ws.call("agents.update", params)
@@ -382,13 +436,14 @@ async def update_agent(
 async def delete_agent(
     agent_id: str,
     delete_files: bool = Query(default=True, description="Propagato a OpenClaw come deleteFiles"),
-    _: AuthenticatedUser = Depends(get_current_user),
+    user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentDeleteResponse:
     agent_id = (agent_id or "").strip()
     if not agent_id:
         raise HTTPException(status_code=400, detail="agent_id is required")
 
     ws = await _get_connected_ws()
+    _ = await _get_owned_agent_or_404(ws, user, agent_id)
 
     try:
         res = await ws.call("agents.delete", {"agentId": agent_id, "deleteFiles": delete_files})

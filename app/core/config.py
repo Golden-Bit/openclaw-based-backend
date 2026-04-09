@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     openclaw_ws_rpc_timeout: float = Field(default=20.0, alias="OPENCLAW_WS_RPC_TIMEOUT")
     openclaw_ws_challenge_timeout: float = Field(default=2.0, alias="OPENCLAW_WS_CHALLENGE_TIMEOUT")
 
+    # Agent ownership (no DB overlay): isolate by per-user workspace namespace
+    agent_workspace_root: str = Field(default="/tmp/openclaw-bff/agents", alias="AGENT_WORKSPACE_ROOT")
+
     # Keycloak
     keycloak_enabled: bool = Field(default=False, alias="KEYCLOAK_ENABLED")
     keycloak_issuer: str | None = Field(default=None, alias="KEYCLOAK_ISSUER")
