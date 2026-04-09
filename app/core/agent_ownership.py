@@ -12,6 +12,17 @@ def user_namespace(user_id: str) -> str:
     if not raw:
         raw = "anonymous"
 
+    salt = (settings.agent_namespace_salt or "").strip() or "dev-namespace-salt"
+    digest = hashlib.sha256(f"{salt}|{raw}".encode("utf-8")).hexdigest()[:24]
+    return f"u-{digest}"
+
+
+def legacy_user_namespace(user_id: str) -> str:
+    """Legacy namespace (slug+short-hash) kept for migration compatibility."""
+    raw = (user_id or "").strip().lower()
+    if not raw:
+        raw = "anonymous"
+
     slug = re.sub(r"[^a-z0-9._-]+", "-", raw).strip("-._")
     if not slug:
         slug = "user"
@@ -23,6 +34,19 @@ def user_namespace(user_id: str) -> str:
 def user_workspace_base(user_id: str) -> Path:
     root = Path(settings.agent_workspace_root).expanduser().resolve()
     return (root / user_namespace(user_id)).resolve()
+
+
+def user_workspace_bases(user_id: str) -> list[Path]:
+    primary = user_workspace_base(user_id)
+    bases = [primary]
+
+    if settings.agent_namespace_allow_legacy:
+        root = Path(settings.agent_workspace_root).expanduser().resolve()
+        legacy = (root / legacy_user_namespace(user_id)).resolve()
+        if legacy != primary:
+            bases.append(legacy)
+
+    return bases
 
 
 def ensure_user_workspace_base(user_id: str) -> Path:
@@ -57,15 +81,15 @@ def is_workspace_owned_by_user(user_id: str, workspace_value: str | None) -> boo
     if not isinstance(workspace_value, str) or not workspace_value.strip():
         return False
 
-    base = user_workspace_base(user_id)
-
     try:
         target = Path(workspace_value).expanduser().resolve()
     except Exception:
         return False
 
-    try:
-        target.relative_to(base)
-        return True
-    except ValueError:
-        return False
+    for base in user_workspace_bases(user_id):
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            continue
+    return False

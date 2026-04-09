@@ -54,6 +54,12 @@ class Settings(BaseSettings):
 
     # Agent ownership (no DB overlay): isolate by per-user workspace namespace
     agent_workspace_root: str = Field(default="/tmp/openclaw-bff/agents", alias="AGENT_WORKSPACE_ROOT")
+    agent_namespace_salt: str = Field(default="dev-namespace-salt", alias="AGENT_NAMESPACE_SALT")
+    agent_namespace_allow_legacy: bool = Field(default=True, alias="AGENT_NAMESPACE_ALLOW_LEGACY")
+
+    # Shared files hosting
+    shared_files_root: str = Field(default="/tmp/openclaw-bff/shared-files", alias="SHARED_FILES_ROOT")
+    shared_files_url_prefix: str = Field(default="/shared/files", alias="SHARED_FILES_URL_PREFIX")
 
     # Keycloak
     keycloak_enabled: bool = Field(default=False, alias="KEYCLOAK_ENABLED")

@@ -6,9 +6,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.shared_files import router as shared_files_router
 from app.core.config import settings
 from app.core.minio_client import ensure_bucket, get_minio_client
 from app.core.openclaw_ws import OpenClawWSClient
+from app.core.shared_files import ensure_shared_files_root
 from app.db.init_db import init_db
 from app.db.session import engine
 
@@ -49,6 +51,13 @@ async def lifespan(app: FastAPI):
 
     # WS client is lazy; we don't force connect here.
 
+    # Shared files root
+    try:
+        shared_root = ensure_shared_files_root()
+        logger.info("Shared files root ensured: %s", shared_root)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Shared files root init failed (continuing): %s", e)
+
     yield
 
     # Shutdown
@@ -86,3 +95,4 @@ app.add_middleware(
 # Routers
 app.include_router(api_router)
 app.include_router(openai_router)
+app.include_router(shared_files_router)
