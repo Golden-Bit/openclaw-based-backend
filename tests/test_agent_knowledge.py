@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api.v1.endpoints import knowledge as knowledge_endpoint
+from app.core.security import AuthenticatedUser
 from app.schemas.knowledge import (
     KnowledgeFileBase64UploadRequest,
     KnowledgeFilePutRequest,
@@ -33,13 +34,17 @@ class _FakeWS:
         return self.responses.get(method, {})
 
 
+def _user(uid: str = "u1") -> AuthenticatedUser:
+    return AuthenticatedUser(user_id=uid, claims={})
+
+
 def _patch_context(monkeypatch: MonkeyPatch, tmp_path: Path, ws: _FakeWS | None = None):
     workspace = tmp_path / "ws"
     root = (workspace / "memory" / "knowledge").resolve()
     root.mkdir(parents=True, exist_ok=True)
     fake_ws = ws or _FakeWS()
 
-    async def _agent_context(agent_id: str):
+    async def _agent_context(agent_id: str, user: AuthenticatedUser):
         return agent_id, fake_ws, str(workspace), root
 
     monkeypatch.setattr(knowledge_endpoint, "_agent_context", _agent_context)
@@ -49,10 +54,10 @@ def _patch_context(monkeypatch: MonkeyPatch, tmp_path: Path, ws: _FakeWS | None 
 def test_create_and_list_tree(monkeypatch: MonkeyPatch, tmp_path: Path):
     root, _ = _patch_context(monkeypatch, tmp_path)
 
-    _ = asyncio.run(knowledge_endpoint.create_folder("main", KnowledgeFolderCreateRequest(path="project-a/docs")))
+    _ = asyncio.run(knowledge_endpoint.create_folder("main", KnowledgeFolderCreateRequest(path="project-a/docs"), _user("u1")))
     (root / "project-a" / "docs" / "a.md").write_text("hello", encoding="utf-8")
 
-    res = asyncio.run(knowledge_endpoint.knowledge_tree("main", path="project-a"))
+    res = asyncio.run(knowledge_endpoint.knowledge_tree("main", path="project-a", user=_user("u1")))
 
     assert res.path == "project-a"
     assert {i.name for i in res.items} == {"docs"}
@@ -62,7 +67,7 @@ def test_prevent_path_traversal(monkeypatch: MonkeyPatch, tmp_path: Path):
     _patch_context(monkeypatch, tmp_path)
 
     with pytest.raises(HTTPException) as exc_info:
-        _ = asyncio.run(knowledge_endpoint.create_folder("main", KnowledgeFolderCreateRequest(path="../escape")))
+        _ = asyncio.run(knowledge_endpoint.create_folder("main", KnowledgeFolderCreateRequest(path="../escape"), _user("u1")))
 
     assert exc_info.value.status_code == 400
 
@@ -75,12 +80,13 @@ def test_move_and_delete_folder(monkeypatch: MonkeyPatch, tmp_path: Path):
         knowledge_endpoint.move_folder(
             "main",
             KnowledgeFolderMoveRequest(from_path="one", to_path="two/renamed"),
+            _user("u1"),
         )
     )
     assert moved.ok is True
     assert (root / "two" / "renamed").exists()
 
-    deleted = asyncio.run(knowledge_endpoint.delete_folder("main", path="two", recursive=True))
+    deleted = asyncio.run(knowledge_endpoint.delete_folder("main", path="two", recursive=True, user=_user("u1")))
     assert deleted.deleted is True
     assert not (root / "two").exists()
 
@@ -91,7 +97,7 @@ def test_delete_non_empty_folder_without_recursive_returns_409(monkeypatch: Monk
     (root / "full" / "a.md").write_text("x", encoding="utf-8")
 
     with pytest.raises(HTTPException) as exc_info:
-        _ = asyncio.run(knowledge_endpoint.delete_folder("main", path="full", recursive=False))
+        _ = asyncio.run(knowledge_endpoint.delete_folder("main", path="full", recursive=False, user=_user("u1")))
 
     assert exc_info.value.status_code == 409
 
@@ -110,16 +116,17 @@ def test_upload_base64_read_and_delete(monkeypatch: MonkeyPatch, tmp_path: Path)
                 content_base64=payload,
                 overwrite=False,
             ),
+            _user("u1"),
         )
     )
     assert created.ok is True
     assert created.path == "research/note.md"
 
-    content = asyncio.run(knowledge_endpoint.read_file_content("main", path="research/note.md"))
+    content = asyncio.run(knowledge_endpoint.read_file_content("main", path="research/note.md", user=_user("u1")))
     assert content.content_text == "hello knowledge"
     assert content.content_base64 is None
 
-    deleted = asyncio.run(knowledge_endpoint.delete_file("main", path="research/note.md"))
+    deleted = asyncio.run(knowledge_endpoint.delete_file("main", path="research/note.md", user=_user("u1")))
     assert deleted.deleted is True
 
 
@@ -136,6 +143,7 @@ def test_upload_base64_rejects_invalid_filename(monkeypatch: MonkeyPatch, tmp_pa
                     content_base64=base64.b64encode(b"x").decode("ascii"),
                     overwrite=False,
                 ),
+                _user("u1"),
             )
         )
 
@@ -151,6 +159,7 @@ def test_replace_file_requires_upsert_when_missing(monkeypatch: MonkeyPatch, tmp
             knowledge_endpoint.replace_file(
                 "main",
                 KnowledgeFilePutRequest(path="a/missing.md", content_base64=payload, upsert=False),
+                _user("u1"),
             )
         )
 
@@ -168,6 +177,7 @@ def test_upload_multipart_overwrite(monkeypatch: MonkeyPatch, tmp_path: Path):
             path="folder",
             filename=None,
             overwrite=False,
+            user=_user("u1"),
         )
     )
 
@@ -180,6 +190,7 @@ def test_upload_multipart_overwrite(monkeypatch: MonkeyPatch, tmp_path: Path):
                 path="folder",
                 filename=None,
                 overwrite=False,
+                user=_user("u1"),
             )
         )
     assert exc_info.value.status_code == 409
@@ -192,6 +203,7 @@ def test_upload_multipart_overwrite(monkeypatch: MonkeyPatch, tmp_path: Path):
             path="folder",
             filename=None,
             overwrite=True,
+            user=_user("u1"),
         )
     )
     assert updated.size_bytes == len(b"second")
@@ -201,7 +213,7 @@ def test_reindex_best_effort(monkeypatch: MonkeyPatch, tmp_path: Path):
     root, ws = _patch_context(monkeypatch, tmp_path, ws=_FakeWS(responses={"doctor.memory.status": {"ok": True}}))
     assert root.exists()
 
-    res = asyncio.run(knowledge_endpoint.reindex_knowledge("main"))
+    res = asyncio.run(knowledge_endpoint.reindex_knowledge("main", _user("u1")))
 
     assert res.accepted is True
     assert res.mode == "eventual"
@@ -214,7 +226,7 @@ def test_download_file_response(monkeypatch: MonkeyPatch, tmp_path: Path):
     p = root / "dl" / "file.md"
     p.write_text("download-me", encoding="utf-8")
 
-    res = asyncio.run(knowledge_endpoint.download_file("main", path="dl/file.md"))
+    res = asyncio.run(knowledge_endpoint.download_file("main", path="dl/file.md", user=_user("u1")))
 
     assert res.filename == "file.md"
     assert str(res.path).endswith(str(p))
@@ -231,6 +243,24 @@ def test_agent_context_rejects_relative_workspace(monkeypatch: MonkeyPatch):
     monkeypatch.setattr(knowledge_endpoint, "_resolve_agent_workspace", _resolve_agent_workspace)
 
     with pytest.raises(HTTPException) as exc_info:
-        _ = asyncio.run(knowledge_endpoint._agent_context("main"))
+        _ = asyncio.run(knowledge_endpoint._agent_context("main", _user("u1")))
 
     assert exc_info.value.status_code == 409
+
+
+def test_agent_context_rejects_foreign_workspace(monkeypatch: MonkeyPatch, tmp_path: Path):
+    foreign_workspace = str((tmp_path / "foreign").resolve())
+
+    async def _get_connected_ws():
+        return _FakeWS()
+
+    async def _resolve_agent_workspace(_ws, _aid: str) -> str:
+        return foreign_workspace
+
+    monkeypatch.setattr(knowledge_endpoint.agents_endpoint, "_get_connected_ws", _get_connected_ws)
+    monkeypatch.setattr(knowledge_endpoint, "_resolve_agent_workspace", _resolve_agent_workspace)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(knowledge_endpoint._agent_context("main", _user("u1")))
+
+    assert exc_info.value.status_code == 404

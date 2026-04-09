@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api.v1.endpoints import agents as agents_endpoint
+from app.core.agent_ownership import normalize_workspace_for_user
+from app.core.security import AuthenticatedUser
 from app.schemas.agents import AgentCreateRequest, AgentUpdateRequest
 
 
@@ -39,6 +41,10 @@ def _patch_ws(monkeypatch: MonkeyPatch, ws: _FakeWS):
     monkeypatch.setattr(agents_endpoint, "_get_connected_ws", _get_connected_ws)
 
 
+def _user(uid: str = "u1") -> AuthenticatedUser:
+    return AuthenticatedUser(user_id=uid, claims={})
+
+
 def test_map_ws_error_unsupported_method():
     exc = Exception("method_not_found: agents.files.list")
     err = agents_endpoint._map_ws_error("agents.files.list", exc)
@@ -52,6 +58,8 @@ def test_map_ws_error_missing_scope():
 
 
 def test_list_agents_success(monkeypatch: MonkeyPatch):
+    owned_ws = normalize_workspace_for_user("u1", "ws")
+    other_ws = normalize_workspace_for_user("u2", "ws")
     ws = _FakeWS(
         responses={
             "agents.list": {
@@ -62,21 +70,21 @@ def test_list_agents_success(monkeypatch: MonkeyPatch):
                     {
                         "id": "main",
                         "name": "Main",
-                        "workspace": "/tmp/ws",
+                        "workspace": owned_ws,
                         "model": {"primary": "gpt-4.1", "fallbacks": ["gpt-4o-mini"]},
                     },
-                    {"id": "other", "name": "Other", "workspace": "/tmp/other", "model": {}},
+                    {"id": "other", "name": "Other", "workspace": other_ws, "model": {}},
                 ],
             }
         }
     )
     _patch_ws(monkeypatch, ws)
 
-    res = asyncio.run(agents_endpoint.list_agents())
+    res = asyncio.run(agents_endpoint.list_agents(_user("u1")))
 
     assert res.default_agent_id == "main"
     assert res.main_key == "key-1"
-    assert len(res.items) == 2
+    assert len(res.items) == 1
     assert res.items[0].is_default is True
     assert res.items[0].model == "gpt-4.1"
     assert res.items[0].model_fallbacks == ["gpt-4o-mini"]
@@ -84,6 +92,7 @@ def test_list_agents_success(monkeypatch: MonkeyPatch):
 
 
 def test_list_agents_uses_identity_name_and_string_model(monkeypatch: MonkeyPatch):
+    owned_ws = normalize_workspace_for_user("u1", "ws")
     ws = _FakeWS(
         responses={
             "agents.list": {
@@ -95,7 +104,7 @@ def test_list_agents_uses_identity_name_and_string_model(monkeypatch: MonkeyPatc
                         "id": "main",
                         "name": "",
                         "identity": {"name": "Main from identity"},
-                        "workspace": None,
+                        "workspace": owned_ws,
                         "model": "openai:gpt-4.1",
                     }
                 ],
@@ -104,7 +113,7 @@ def test_list_agents_uses_identity_name_and_string_model(monkeypatch: MonkeyPatc
     )
     _patch_ws(monkeypatch, ws)
 
-    res = asyncio.run(agents_endpoint.list_agents())
+    res = asyncio.run(agents_endpoint.list_agents(_user("u1")))
 
     assert len(res.items) == 1
     assert res.items[0].name == "Main from identity"
@@ -112,12 +121,14 @@ def test_list_agents_uses_identity_name_and_string_model(monkeypatch: MonkeyPatc
 
 
 def test_create_agent_success(monkeypatch: MonkeyPatch):
+    expected_ws = normalize_workspace_for_user("u1", "a1")
     ws = _FakeWS(responses={"agents.create": {"ok": True, "agentId": "a-1", "name": "Agent 1", "workspace": "/tmp/a1"}})
     _patch_ws(monkeypatch, ws)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
-            AgentCreateRequest(name="Agent 1", workspace="/tmp/a1", emoji="🤖"),
+            AgentCreateRequest(name="Agent 1", workspace="a1", emoji="🤖"),
+            _user("u1"),
         )
     )
 
@@ -130,7 +141,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
             "agents.create",
             {
                 "name": "Agent 1",
-                "workspace": "/tmp/a1",
+                "workspace": expected_ws,
                 "emoji": "🤖",
             },
         )
@@ -145,18 +156,35 @@ def test_create_agent_rejects_empty_workspace(monkeypatch: MonkeyPatch):
         _ = asyncio.run(
             agents_endpoint.create_agent(
                 AgentCreateRequest(name="Agent 1", workspace="   "),
+                _user("u1"),
             )
         )
 
     assert exc_info.value.status_code == 400
 
 
+def test_create_agent_rejects_foreign_absolute_workspace(monkeypatch: MonkeyPatch):
+    ws = _FakeWS()
+    _patch_ws(monkeypatch, ws)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            agents_endpoint.create_agent(
+                AgentCreateRequest(name="Agent 1", workspace="/tmp/foreign"),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 403
+
+
 def test_get_agent_with_identity_and_files(monkeypatch: MonkeyPatch):
+    owned_ws = normalize_workspace_for_user("u1", "ws")
     ws = _FakeWS(
         responses={
             "agents.list": {
                 "defaultId": "main",
-                "agents": [{"id": "main", "name": "Main", "workspace": "/tmp/ws", "model": {}}],
+                "agents": [{"id": "main", "name": "Main", "workspace": owned_ws, "model": {}}],
             },
             "agent.identity.get": {"agentId": "main", "avatarUrl": "https://example/avatar.png"},
             "agents.files.list": {"files": [{"id": "f1", "name": "bootstrap.md"}]},
@@ -164,7 +192,7 @@ def test_get_agent_with_identity_and_files(monkeypatch: MonkeyPatch):
     )
     _patch_ws(monkeypatch, ws)
 
-    res = asyncio.run(agents_endpoint.get_agent("main", include_files=True))
+    res = asyncio.run(agents_endpoint.get_agent("main", include_files=True, user=_user("u1")))
 
     assert res.agent_id == "main"
     assert res.identity is not None
@@ -179,35 +207,42 @@ def test_get_agent_returns_404_when_missing(monkeypatch: MonkeyPatch):
     _patch_ws(monkeypatch, ws)
 
     with pytest.raises(HTTPException) as exc_info:
-        asyncio.run(agents_endpoint.get_agent("missing", include_files=False))
+        asyncio.run(agents_endpoint.get_agent("missing", include_files=False, user=_user("u1")))
 
     assert exc_info.value.status_code == 404
 
 
 def test_update_agent_requires_at_least_one_field(monkeypatch: MonkeyPatch):
-    ws = _FakeWS()
+    ws = _FakeWS(responses={"agents.list": {"defaultId": "main", "agents": [{"id": "main", "workspace": normalize_workspace_for_user('u1', 'ws')}]}})
     _patch_ws(monkeypatch, ws)
 
     with pytest.raises(HTTPException) as exc_info:
-        _ = asyncio.run(agents_endpoint.update_agent("main", AgentUpdateRequest()))
+        _ = asyncio.run(agents_endpoint.update_agent("main", AgentUpdateRequest(), _user("u1")))
 
     assert exc_info.value.status_code == 400
 
 
 def test_update_agent_success(monkeypatch: MonkeyPatch):
-    ws = _FakeWS(responses={"agents.update": {"ok": True}})
+    ws = _FakeWS(
+        responses={
+            "agents.list": {"defaultId": "main", "agents": [{"id": "main", "workspace": normalize_workspace_for_user('u1', 'ws')}]},
+            "agents.update": {"ok": True},
+        }
+    )
     _patch_ws(monkeypatch, ws)
 
     res = asyncio.run(
         agents_endpoint.update_agent(
             "main",
             AgentUpdateRequest(name="Main Agent", model="gpt-4.1"),
+            _user("u1"),
         )
     )
 
     assert res.updated is True
     assert res.agent_id == "main"
     assert ws.calls == [
+        ("agents.list", {}),
         (
             "agents.update",
             {
@@ -220,12 +255,57 @@ def test_update_agent_success(monkeypatch: MonkeyPatch):
 
 
 def test_delete_agent_success(monkeypatch: MonkeyPatch):
-    ws = _FakeWS(responses={"agents.delete": {"removedBindings": 3}})
+    ws = _FakeWS(
+        responses={
+            "agents.list": {"defaultId": "main", "agents": [{"id": "main", "workspace": normalize_workspace_for_user('u1', 'ws')}]},
+            "agents.delete": {"removedBindings": 3},
+        }
+    )
     _patch_ws(monkeypatch, ws)
 
-    res = asyncio.run(agents_endpoint.delete_agent("main", delete_files=False))
+    res = asyncio.run(agents_endpoint.delete_agent("main", delete_files=False, user=_user("u1")))
 
     assert res.deleted is True
     assert res.agent_id == "main"
     assert res.removed_bindings == 3
-    assert ws.calls == [("agents.delete", {"agentId": "main", "deleteFiles": False})]
+    assert ws.calls == [
+        ("agents.list", {}),
+        ("agents.delete", {"agentId": "main", "deleteFiles": False}),
+    ]
+
+
+def test_update_agent_returns_404_when_workspace_not_owned(monkeypatch: MonkeyPatch):
+    ws = _FakeWS(
+        responses={
+            "agents.list": {"defaultId": "main", "agents": [{"id": "main", "workspace": normalize_workspace_for_user('u2', 'ws')}]},
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            agents_endpoint.update_agent(
+                "main",
+                AgentUpdateRequest(name="new"),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+def test_get_agent_returns_404_when_workspace_is_not_owned(monkeypatch: MonkeyPatch):
+    ws = _FakeWS(
+        responses={
+            "agents.list": {
+                "defaultId": "main",
+                "agents": [{"id": "main", "workspace": normalize_workspace_for_user("u2", "ws")}],
+            }
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(agents_endpoint.get_agent("main", include_files=False, user=_user("u1")))
+
+    assert exc_info.value.status_code == 404
