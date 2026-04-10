@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.core.agent_ownership import is_workspace_owned_by_user, normalize_workspace_for_user
+from app.core.agent_ownership import is_workspace_owned_by_user, normalize_workspace_for_user, user_workspace_bases
 from app.core.agent_share_skill import ensure_share_skill_for_agent
 from app.core.config import settings
 from app.core.openclaw_ws import OpenClawWSClient
@@ -23,6 +24,11 @@ from app.schemas.agents import (
 router = APIRouter(prefix="/agents")
 
 _agents_ws_client: OpenClawWSClient | None = None
+logger = logging.getLogger(__name__)
+
+
+def _workspace_bases_as_posix(user_id: str) -> list[str]:
+    return [base.as_posix() for base in user_workspace_bases(user_id)]
 
 
 def _is_method_unsupported(error_text: str) -> bool:
@@ -117,7 +123,16 @@ def _workspace_from_raw_agent(raw: Dict[str, Any]) -> Optional[str]:
 
 def _enforce_agent_ownership_or_404(user: AuthenticatedUser, raw_agent: Dict[str, Any], *, requested_agent_id: str) -> str:
     workspace = _workspace_from_raw_agent(raw_agent)
-    if not is_workspace_owned_by_user(user.user_id, workspace):
+    owned = is_workspace_owned_by_user(user.user_id, workspace)
+    if not owned:
+        logger.warning(
+            "agents.ownership denied user_id=%s requested_agent_id=%s agent_id=%s workspace=%s expected_bases=%s",
+            user.user_id,
+            requested_agent_id,
+            str(raw_agent.get("id") or "").strip() or None,
+            workspace,
+            _workspace_bases_as_posix(user.user_id),
+        )
         raise HTTPException(status_code=404, detail=f"Agent '{requested_agent_id}' not found")
     return workspace or ""
 
@@ -209,6 +224,23 @@ async def create_agent(
             result_workspace = rworkspace.strip()
 
     effective_workspace = result_workspace or workspace
+    expected_bases = _workspace_bases_as_posix(user.user_id)
+    effective_owned = is_workspace_owned_by_user(user.user_id, effective_workspace)
+
+    logger.info(
+        (
+            "agents.create ownership context user_id=%s input_workspace=%s normalized_workspace=%s "
+            "gateway_workspace=%s effective_workspace=%s expected_bases=%s owned_effective=%s agent_id=%s"
+        ),
+        user.user_id,
+        workspace_input,
+        workspace,
+        result_workspace,
+        effective_workspace,
+        expected_bases,
+        effective_owned,
+        agent_id,
+    )
 
     try:
         _ = ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)
@@ -282,11 +314,26 @@ async def list_agents(
     if not isinstance(raw_agents, list):
         raw_agents = []
 
+    expected_bases = _workspace_bases_as_posix(user.user_id)
     items: list[AgentSummary] = []
     for agent in raw_agents:
         if not isinstance(agent, dict):
             continue
-        if not is_workspace_owned_by_user(user.user_id, _workspace_from_raw_agent(agent)):
+
+        workspace = _workspace_from_raw_agent(agent)
+        agent_id = str(agent.get("id") or "").strip() or None
+        owned = is_workspace_owned_by_user(user.user_id, workspace)
+
+        logger.info(
+            "agents.list ownership check user_id=%s agent_id=%s workspace=%s expected_bases=%s owned=%s",
+            user.user_id,
+            agent_id,
+            workspace,
+            expected_bases,
+            owned,
+        )
+
+        if not owned:
             continue
         items.append(_normalize_agent_summary(agent, default_agent_id=default_agent_id))
 
@@ -329,6 +376,23 @@ async def get_agent(
     selected = _find_agent(raw_agents, agent_id)
     if selected is None:
         raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+
+    selected_workspace = _workspace_from_raw_agent(selected)
+    expected_bases = _workspace_bases_as_posix(user.user_id)
+    selected_owned = is_workspace_owned_by_user(user.user_id, selected_workspace)
+
+    logger.info(
+        (
+            "agents.get ownership check user_id=%s requested_agent_id=%s selected_agent_id=%s "
+            "workspace=%s expected_bases=%s owned=%s"
+        ),
+        user.user_id,
+        agent_id,
+        str(selected.get("id") or "").strip() or None,
+        selected_workspace,
+        expected_bases,
+        selected_owned,
+    )
 
     _enforce_agent_ownership_or_404(user, selected, requested_agent_id=agent_id)
 

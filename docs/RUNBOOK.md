@@ -12,6 +12,15 @@
 cp .env.example .env
 ```
 
+Reference canonica completa:
+- [`ENV_REFERENCE.md`](ENV_REFERENCE.md)
+
+La reference distingue chiaramente:
+- variabili presenti in `.env.example`
+- variabili opzionali commentate
+- variabili runtime aggiuntive non presenti nel file example
+- alias/nomi legacy rispetto ai nomi runtime effettivi
+
 Verifica almeno:
 - `DATABASE_URL`
 - `OPENCLAW_HTTP_BASE`

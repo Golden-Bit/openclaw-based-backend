@@ -102,6 +102,15 @@ Nota: questa surface è un proxy autenticato verso OpenClaw; non usa il mapping 
 cp .env.example .env
 ```
 
+Reference completa delle variabili documentate del progetto:
+- [`docs/ENV_REFERENCE.md`](docs/ENV_REFERENCE.md)
+
+La reference include:
+- tutte le variabili presenti in `.env.example`
+- le variabili opzionali commentate
+- le principali variabili runtime aggiuntive lette dal backend ma non presenti nel file example
+- le mappature tra nomi example/legacy e nomi runtime effettivi
+
 Aggiorna almeno:
 - `DATABASE_URL`
 - `OPENCLAW_HTTP_BASE`
@@ -113,6 +122,16 @@ Aggiorna almeno:
 - `KEYCLOAK_PUBLIC_URL` (dominio pubblico Keycloak: http/https)
 - `KEYCLOAK_INTERNAL_URL` (URL interno usato da script bootstrap)
 - `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL`, `KEYCLOAK_AUDIENCE` (coerenti con realm/client)
+
+Se stai preparando un deploy reale, leggi anche la sezione dedicata a:
+- `AGENT_WORKSPACE_ROOT`
+- `AGENT_NAMESPACE_SALT`
+- `AGENT_NAMESPACE_ALLOW_LEGACY`
+- `SHARED_FILES_ROOT`
+- `SHARED_FILES_URL_PREFIX`
+- `BFF_PUBLIC_BASE_URL`
+
+Queste variabili governano isolamento dei workspace agente, ownership utente e hosting pubblico dei file condivisi.
 
 ### 2) Infra locale (Postgres/MinIO/Keycloak)
 
