@@ -58,6 +58,11 @@ def _user(uid: str = "u1") -> AuthenticatedUser:
     return AuthenticatedUser(user_id=uid, claims={})
 
 
+@pytest.fixture(autouse=True)
+def _enable_ownership_enforcement_for_tests(monkeypatch: MonkeyPatch):
+    monkeypatch.setattr(agents_endpoint, "ENFORCE_AGENT_WORKSPACE_OWNERSHIP", True)
+
+
 def test_map_ws_error_unsupported_method():
     exc = Exception("method_not_found: agents.files.list")
     err = agents_endpoint._map_ws_error("agents.files.list", exc)
@@ -347,3 +352,27 @@ def test_get_agent_returns_404_when_workspace_is_not_owned(monkeypatch: MonkeyPa
         _ = asyncio.run(agents_endpoint.get_agent("main", include_files=False, user=_user("u1")))
 
     assert exc_info.value.status_code == 404
+
+
+def test_list_and_get_allow_missing_workspace_when_ownership_enforcement_disabled(monkeypatch: MonkeyPatch):
+    monkeypatch.setattr(agents_endpoint, "ENFORCE_AGENT_WORKSPACE_OWNERSHIP", False)
+    ws = _FakeWS(
+        responses={
+            "agents.list": {
+                "defaultId": "main",
+                "agents": [
+                    {"id": "main", "name": "Main"},
+                    {"id": "a-1", "name": "Agent 1"},
+                ],
+            },
+            "agent.identity.get": {},
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+
+    list_res = asyncio.run(agents_endpoint.list_agents(_user("u1")))
+    get_res = asyncio.run(agents_endpoint.get_agent("a-1", include_files=False, user=_user("u1")))
+
+    assert len(list_res.items) == 2
+    assert {item.agent_id for item in list_res.items} == {"main", "a-1"}
+    assert get_res.agent_id == "a-1"

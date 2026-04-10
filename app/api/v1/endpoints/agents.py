@@ -26,9 +26,21 @@ router = APIRouter(prefix="/agents")
 _agents_ws_client: OpenClawWSClient | None = None
 logger = logging.getLogger(__name__)
 
+# Temporary hardcoded switch for ownership gating on agents endpoints.
+# Keep False while gateway agents.list does not reliably return `workspace`.
+ENFORCE_AGENT_WORKSPACE_OWNERSHIP = False
+
 
 def _workspace_bases_as_posix(user_id: str) -> list[str]:
     return [base.as_posix() for base in user_workspace_bases(user_id)]
+
+
+def _is_ownership_enforced() -> bool:
+    return bool(ENFORCE_AGENT_WORKSPACE_OWNERSHIP)
+
+
+def _log_agents_list_raw(*, context: str, payload: Any) -> None:
+    logger.info("agents.list raw context=%s payload=%r", context, payload)
 
 
 def _is_method_unsupported(error_text: str) -> bool:
@@ -124,6 +136,22 @@ def _workspace_from_raw_agent(raw: Dict[str, Any]) -> Optional[str]:
 def _enforce_agent_ownership_or_404(user: AuthenticatedUser, raw_agent: Dict[str, Any], *, requested_agent_id: str) -> str:
     workspace = _workspace_from_raw_agent(raw_agent)
     owned = is_workspace_owned_by_user(user.user_id, workspace)
+
+    if not _is_ownership_enforced():
+        if not owned:
+            logger.warning(
+                (
+                    "agents.ownership bypassed user_id=%s requested_agent_id=%s agent_id=%s "
+                    "workspace=%s expected_bases=%s"
+                ),
+                user.user_id,
+                requested_agent_id,
+                str(raw_agent.get("id") or "").strip() or None,
+                workspace,
+                _workspace_bases_as_posix(user.user_id),
+            )
+        return workspace or ""
+
     if not owned:
         logger.warning(
             "agents.ownership denied user_id=%s requested_agent_id=%s agent_id=%s workspace=%s expected_bases=%s",
@@ -142,6 +170,8 @@ async def _get_owned_agent_or_404(ws, user: AuthenticatedUser, agent_id: str) ->
         list_payload = await ws.call("agents.list", {})
     except Exception as e:  # noqa: BLE001
         raise _map_ws_error("agents.list", e, not_found_agent_id=agent_id)
+
+    _log_agents_list_raw(context="owned_agent_lookup", payload=list_payload)
 
     if not isinstance(list_payload, dict):
         raise HTTPException(status_code=502, detail=f"Unexpected OpenClaw payload for agents.list: {list_payload!r}")
@@ -226,11 +256,12 @@ async def create_agent(
     effective_workspace = result_workspace or workspace
     expected_bases = _workspace_bases_as_posix(user.user_id)
     effective_owned = is_workspace_owned_by_user(user.user_id, effective_workspace)
+    ownership_enforced = _is_ownership_enforced()
 
     logger.info(
         (
             "agents.create ownership context user_id=%s input_workspace=%s normalized_workspace=%s "
-            "gateway_workspace=%s effective_workspace=%s expected_bases=%s owned_effective=%s agent_id=%s"
+            "gateway_workspace=%s effective_workspace=%s expected_bases=%s owned_effective=%s ownership_enforced=%s agent_id=%s"
         ),
         user.user_id,
         workspace_input,
@@ -239,6 +270,7 @@ async def create_agent(
         effective_workspace,
         expected_bases,
         effective_owned,
+        ownership_enforced,
         agent_id,
     )
 
@@ -303,6 +335,8 @@ async def list_agents(
     except Exception as e:  # noqa: BLE001
         raise _map_ws_error("agents.list", e)
 
+    _log_agents_list_raw(context="list_agents", payload=payload)
+
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail=f"Unexpected OpenClaw payload for agents.list: {payload!r}")
 
@@ -315,6 +349,7 @@ async def list_agents(
         raw_agents = []
 
     expected_bases = _workspace_bases_as_posix(user.user_id)
+    ownership_enforced = _is_ownership_enforced()
     items: list[AgentSummary] = []
     for agent in raw_agents:
         if not isinstance(agent, dict):
@@ -323,17 +358,23 @@ async def list_agents(
         workspace = _workspace_from_raw_agent(agent)
         agent_id = str(agent.get("id") or "").strip() or None
         owned = is_workspace_owned_by_user(user.user_id, workspace)
+        allowed = owned or not ownership_enforced
 
         logger.info(
-            "agents.list ownership check user_id=%s agent_id=%s workspace=%s expected_bases=%s owned=%s",
+            (
+                "agents.list ownership check user_id=%s agent_id=%s workspace=%s "
+                "expected_bases=%s owned=%s ownership_enforced=%s allowed=%s"
+            ),
             user.user_id,
             agent_id,
             workspace,
             expected_bases,
             owned,
+            ownership_enforced,
+            allowed,
         )
 
-        if not owned:
+        if not allowed:
             continue
         items.append(_normalize_agent_summary(agent, default_agent_id=default_agent_id))
 
@@ -366,6 +407,8 @@ async def get_agent(
     except Exception as e:  # noqa: BLE001
         raise _map_ws_error("agents.list", e)
 
+    _log_agents_list_raw(context="get_agent", payload=list_payload)
+
     if not isinstance(list_payload, dict):
         raise HTTPException(status_code=502, detail=f"Unexpected OpenClaw payload for agents.list: {list_payload!r}")
 
@@ -380,11 +423,13 @@ async def get_agent(
     selected_workspace = _workspace_from_raw_agent(selected)
     expected_bases = _workspace_bases_as_posix(user.user_id)
     selected_owned = is_workspace_owned_by_user(user.user_id, selected_workspace)
+    ownership_enforced = _is_ownership_enforced()
+    selected_allowed = selected_owned or not ownership_enforced
 
     logger.info(
         (
             "agents.get ownership check user_id=%s requested_agent_id=%s selected_agent_id=%s "
-            "workspace=%s expected_bases=%s owned=%s"
+            "workspace=%s expected_bases=%s owned=%s ownership_enforced=%s allowed=%s"
         ),
         user.user_id,
         agent_id,
@@ -392,6 +437,8 @@ async def get_agent(
         selected_workspace,
         expected_bases,
         selected_owned,
+        ownership_enforced,
+        selected_allowed,
     )
 
     _enforce_agent_ownership_or_404(user, selected, requested_agent_id=agent_id)
