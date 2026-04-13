@@ -30,3 +30,26 @@ def test_user_workspace_legacy_compat(monkeypatch: MonkeyPatch, tmp_path: Path):
     legacy_target.mkdir(parents=True, exist_ok=True)
 
     assert agent_ownership.is_workspace_owned_by_user("u1", legacy_target.as_posix()) is True
+
+
+def test_build_user_scoped_agent_id_adds_user_prefix():
+    aid = agent_ownership.build_user_scoped_agent_id("Mario.Rossi", "Sales Bot")
+
+    assert aid.startswith("mario-rossi-")
+    assert "sales-bot" in aid
+    assert len(aid) <= agent_ownership.MAX_OPENCLAW_AGENT_ID_LENGTH
+
+
+def test_build_user_scoped_agent_id_respects_max_length():
+    aid = agent_ownership.build_user_scoped_agent_id("u" * 80, "x" * 120)
+
+    assert len(aid) <= agent_ownership.MAX_OPENCLAW_AGENT_ID_LENGTH
+    assert aid[0].isalnum()
+
+
+def test_is_agent_id_owned_by_user_checks_prefix():
+    own = agent_ownership.build_user_scoped_agent_id("u1", "agent")
+    other = agent_ownership.build_user_scoped_agent_id("u2", "agent")
+
+    assert agent_ownership.is_agent_id_owned_by_user("u1", own) is True
+    assert agent_ownership.is_agent_id_owned_by_user("u1", other) is False

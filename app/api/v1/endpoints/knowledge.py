@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse
 
 from app.api.v1.endpoints import agents as agents_endpoint
-from app.core.agent_ownership import is_workspace_owned_by_user
+from app.core.agent_ownership import is_agent_id_owned_by_user, resolve_requested_agent_id_for_user
 from app.core.config import settings
 from app.core.knowledge_fs import (
     KnowledgePathError,
@@ -114,17 +114,19 @@ async def _resolve_agent_workspace(ws, agent_id: str) -> str:
 
 
 async def _agent_context(agent_id: str, user: AuthenticatedUser):
-    aid = (agent_id or "").strip()
-    if not aid:
-        raise HTTPException(status_code=400, detail="agent_id is required")
+    try:
+        aid = resolve_requested_agent_id_for_user(user.user_id, agent_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not is_agent_id_owned_by_user(user.user_id, aid):
+        raise HTTPException(status_code=404, detail=f"Agent '{aid}' not found")
 
     ws = await agents_endpoint._get_connected_ws()
     workspace = await _resolve_agent_workspace(ws, aid)
     workspace_path = Path(workspace).expanduser()
     if not workspace_path.is_absolute():
         raise HTTPException(status_code=409, detail=f"Agent '{aid}' workspace must be an absolute path")
-    if not is_workspace_owned_by_user(user.user_id, workspace):
-        raise HTTPException(status_code=404, detail=f"Agent '{aid}' not found")
     root = knowledge_root_for_workspace(workspace)
     ensure_root_dir(root)
     return aid, ws, workspace, root

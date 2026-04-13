@@ -248,7 +248,7 @@ def test_agent_context_rejects_relative_workspace(monkeypatch: MonkeyPatch):
     assert exc_info.value.status_code == 409
 
 
-def test_agent_context_rejects_foreign_workspace(monkeypatch: MonkeyPatch, tmp_path: Path):
+def test_agent_context_accepts_absolute_workspace_when_agent_id_owned(monkeypatch: MonkeyPatch, tmp_path: Path):
     foreign_workspace = str((tmp_path / "foreign").resolve())
 
     async def _get_connected_ws():
@@ -260,7 +260,8 @@ def test_agent_context_rejects_foreign_workspace(monkeypatch: MonkeyPatch, tmp_p
     monkeypatch.setattr(knowledge_endpoint.agents_endpoint, "_get_connected_ws", _get_connected_ws)
     monkeypatch.setattr(knowledge_endpoint, "_resolve_agent_workspace", _resolve_agent_workspace)
 
-    with pytest.raises(HTTPException) as exc_info:
-        _ = asyncio.run(knowledge_endpoint._agent_context("main", _user("u1")))
+    aid, _ws, workspace, root = asyncio.run(knowledge_endpoint._agent_context("main", _user("u1")))
 
-    assert exc_info.value.status_code == 404
+    assert aid == "u1-main"
+    assert workspace == foreign_workspace
+    assert root.as_posix().endswith("/foreign/memory/knowledge")
