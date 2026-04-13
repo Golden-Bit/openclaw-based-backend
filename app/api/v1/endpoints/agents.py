@@ -301,8 +301,30 @@ async def create_agent(
     )
 
     try:
-        _ = ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)
+        skill_path = ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)
+        logger.info(
+            (
+                "agents.create share_skill bootstrap success user_id=%s agent_id=%s "
+                "effective_workspace=%s skill_file=%s"
+            ),
+            user.user_id,
+            agent_id,
+            effective_workspace,
+            skill_path.as_posix(),
+        )
     except Exception as skill_err:  # noqa: BLE001
+        expected_skill_path = f"{effective_workspace.rstrip('/')}/skills/share-files/SKILL.md"
+        logger.exception(
+            (
+                "agents.create share_skill bootstrap failed user_id=%s agent_id=%s "
+                "effective_workspace=%s expected_skill_file=%s"
+            ),
+            user.user_id,
+            agent_id,
+            effective_workspace,
+            expected_skill_path,
+        )
+
         rollback_error: Optional[Exception] = None
         if agent_id:
             try:

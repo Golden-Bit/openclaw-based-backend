@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from app.core.agent_ownership import user_namespace
 from app.core.config import settings
 from app.core.shared_files import normalize_shared_url_prefix
+
+
+logger = logging.getLogger(__name__)
 
 
 def _build_public_shared_base_url() -> str:
@@ -67,12 +71,33 @@ Markdown to send:
 def ensure_share_skill_for_agent(workspace: str, *, user_id: str) -> Path:
     ws = Path(workspace).expanduser().resolve()
     skill_dir = (ws / "skills" / "share-files").resolve()
+
+    logger.info(
+        "share_skill.bootstrap start user_id=%s workspace_input=%s workspace_resolved=%s skill_dir=%s",
+        user_id,
+        workspace,
+        ws.as_posix(),
+        skill_dir.as_posix(),
+    )
+
     skill_dir.mkdir(parents=True, exist_ok=True)
 
     skill_file = (skill_dir / "SKILL.md").resolve()
     if skill_file.exists() and skill_file.is_file():
+        logger.info(
+            "share_skill.bootstrap reuse_existing user_id=%s skill_file=%s",
+            user_id,
+            skill_file.as_posix(),
+        )
         return skill_file
 
     content = _skill_markdown(user_id=user_id)
     skill_file.write_text(content, encoding="utf-8")
+
+    logger.info(
+        "share_skill.bootstrap created user_id=%s skill_file=%s",
+        user_id,
+        skill_file.as_posix(),
+    )
+
     return skill_file
