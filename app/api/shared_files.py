@@ -16,10 +16,22 @@ def _shared_prefix() -> str:
 router = APIRouter(prefix=_shared_prefix())
 
 
+def _should_download(*, download: bool | None, inline: bool) -> bool:
+    if inline:
+        return False
+    if download is None:
+        return True
+    return download
+
+
 @router.get("/{requested_path:path}", summary="Serve file from shared hosting root")
 async def get_shared_file(
     requested_path: str,
-    download: bool = Query(default=False, description="Se true forza download attachment"),
+    download: bool | None = Query(
+        default=None,
+        description="Se true forza attachment, se false forza preview inline. Default: download diretto.",
+    ),
+    inline: bool = Query(default=False, description="Se true forza preview inline nel browser."),
 ) -> FileResponse:
     try:
         target = resolve_shared_file_path(requested_path)
@@ -31,6 +43,6 @@ async def get_shared_file(
 
     media_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
 
-    if download:
+    if _should_download(download=download, inline=inline):
         return FileResponse(path=target, filename=target.name, media_type=media_type)
     return FileResponse(path=target, media_type=media_type)

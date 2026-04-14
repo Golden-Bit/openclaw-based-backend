@@ -174,17 +174,17 @@ curl -s -X DELETE "http://localhost:8000/api/v1/agents/main/knowledge/files?path
   -H 'X-Debug-User: dev-user' | jq
 ```
 
-## Download hosted shared file
+## Download hosted shared file (default behavior)
 
 ```bash
 curl -L "http://localhost:8000/shared/files/public/example.txt" \
   -o ./example.txt
 ```
 
-## Force attachment download from shared hosting
+## Preview hosted shared file inline
 
 ```bash
-curl -L "http://localhost:8000/shared/files/public/example.txt?download=true" \
+curl -L "http://localhost:8000/shared/files/public/example.txt?inline=true" \
   -o ./example.txt
 ```
 

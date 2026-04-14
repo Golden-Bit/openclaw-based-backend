@@ -24,6 +24,7 @@ def _skill_markdown(*, user_id: str) -> str:
     public_base = _build_public_shared_base_url()
     sample_relative = f"{namespace}/exports/<filename>"
     sample_url = f"{public_base}/{sample_relative}"
+    sample_inline_url = f"{sample_url}?inline=true"
 
     return f"""---
 name: share-files
@@ -45,8 +46,9 @@ Use this skill when you need to create files that the user can download via brow
 
 1. Write files only under `{user_share_root}/`
 2. Never write outside that directory.
-3. Build public links as: `{public_base}/<relative_path_from_shared_root>`
-4. Always reply with a markdown download link.
+3. Build default public links as: `{public_base}/<relative_path_from_shared_root>`
+4. Default shared links download directly. Use `?inline=true` only when the user explicitly asks for browser preview.
+5. Always reply with a markdown download link unless the user asked for inline preview.
 
 ## Example
 
@@ -58,13 +60,17 @@ then relative path is:
 
 `{namespace}/reports/q1-summary.pdf`
 
-and public URL is:
+and default public URL is:
 
 `{public_base}/{namespace}/reports/q1-summary.pdf`
 
-Markdown to send:
+Markdown to send for direct download:
 
 `[Scarica file]({sample_url})`
+
+If the user explicitly asks to preview in browser, use:
+
+`[Apri anteprima]({sample_inline_url})`
 """
 
 

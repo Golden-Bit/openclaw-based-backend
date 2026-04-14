@@ -29,6 +29,8 @@ def test_ensure_share_skill_creates_file(monkeypatch: MonkeyPatch, tmp_path: Pat
     assert "name: share-files" in content
     assert f"User namespace (hash-only): `{ns}`" in content
     assert "https://api.example.com/shared/files" in content
+    assert "Default shared links download directly." in content
+    assert "?inline=true" in content
 
 
 def test_ensure_share_skill_does_not_overwrite_existing(monkeypatch: MonkeyPatch, tmp_path: Path):
