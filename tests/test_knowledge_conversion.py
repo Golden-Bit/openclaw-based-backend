@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,3 +42,37 @@ def test_render_markdown_for_docling_missing_dependency(monkeypatch: pytest.Monk
 
     with pytest.raises(KnowledgeConversionDependencyError):
         conversion.render_markdown_for_knowledge_upload('brief.pdf', b'%PDF-1.7 fake')
+
+
+def test_render_markdown_for_docling_reuses_default_converter_and_keeps_output_dir_request_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeConverter:
+        init_calls = 0
+
+        def __init__(self):
+            type(self).init_calls += 1
+            self.output_dirs: list[Path] = []
+
+        def convert_file(self, source: str | Path, output_dir: str | Path):
+            output_path = Path(output_dir)
+            self.output_dirs.append(output_path)
+            markdown_path = output_path / f'{Path(source).stem}.md'
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.write_text(f'converted:{Path(source).name}', encoding='utf-8')
+            return SimpleNamespace(output_markdown=markdown_path)
+
+    monkeypatch.setattr(conversion, '_DEFAULT_DOCLING_CONVERTER', None)
+    monkeypatch.setattr(conversion, '_load_docling_converter_class', lambda: FakeConverter)
+
+    first = conversion.render_markdown_for_knowledge_upload('brief.pdf', b'%PDF-1.7 fake')
+    second = conversion.render_markdown_for_knowledge_upload('deck.pptx', b'fake pptx bytes')
+
+    cached_converter = conversion._DEFAULT_DOCLING_CONVERTER
+    assert FakeConverter.init_calls == 1
+    assert cached_converter is not None
+    assert first == b'converted:brief.pdf'
+    assert second == b'converted:deck.pptx'
+    assert len(cached_converter.output_dirs) == 2
+    assert cached_converter.output_dirs[0] != cached_converter.output_dirs[1]
+    assert all(path.name == 'out' for path in cached_converter.output_dirs)

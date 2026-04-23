@@ -381,12 +381,14 @@ scripts/docling_converter.py
 La classe:
 
 - controlla che il file sia supportato
-- istanzia Docling
+- costruisce una volta il converter Docling riusabile
 - abilita OCR opzionale per i PDF
 - converte il documento
 - esporta il contenuto in Markdown
 - salva output e metadati
 - produce un report di conversione
+
+L'istanza `DoclingMarkdownConverter` non mantiene `output_dir` come stato interno: puoi riusarla per più conversioni e passare la cartella di destinazione a ogni chiamata di `convert_file(..., output_dir=...)` o `convert_many(..., output_dir=...)`.
 
 ### Formati supportati nella demo
 
@@ -580,4 +582,3 @@ Questo bundle ti permette di:
 - usare una classe Python riusabile per conversione batch
 - sperimentare OCR opzionale sui PDF
 - ottenere output `.md` pronti da ispezionare o inviare a pipeline LLM
-

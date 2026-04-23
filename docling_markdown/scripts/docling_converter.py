@@ -21,14 +21,11 @@ class ConversionReport:
 
 @dataclass
 class DoclingMarkdownConverter:
-    output_dir: Path
     do_ocr: bool = False
     force_full_page_ocr: bool = False
     abort_on_error: bool = True
 
     def __post_init__(self) -> None:
-        self.output_dir = Path(self.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self._converter = self._build_converter()
 
     def _build_converter(self):
@@ -64,17 +61,23 @@ class DoclingMarkdownConverter:
     def supports(self, path: str | Path) -> bool:
         return Path(path).suffix.lower() in SUPPORTED_SUFFIXES
 
-    def _target_markdown_path(self, source: Path) -> Path:
-        return self.output_dir / f"{source.stem}.md"
+    def _resolve_output_dir(self, output_dir: str | Path) -> Path:
+        resolved = Path(output_dir)
+        resolved.mkdir(parents=True, exist_ok=True)
+        return resolved
 
-    def convert_file(self, source: str | Path) -> ConversionReport:
+    def _target_markdown_path(self, source: Path, output_dir: Path) -> Path:
+        return output_dir / f"{source.stem}.md"
+
+    def convert_file(self, source: str | Path, output_dir: str | Path) -> ConversionReport:
         src = Path(source)
         if not src.exists():
             raise FileNotFoundError(f"Input file not found: {src}")
         if not self.supports(src):
             raise ValueError(f"Unsupported input type: {src.suffix}")
 
-        target = self._target_markdown_path(src)
+        resolved_output_dir = self._resolve_output_dir(output_dir)
+        target = self._target_markdown_path(src, resolved_output_dir)
         result = self._converter.convert(str(src))
         document = result.document
         markdown = document.export_to_markdown()
@@ -95,16 +98,17 @@ class DoclingMarkdownConverter:
         meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
         return ConversionReport(source=src, output_markdown=target, status="ok", metadata=metadata)
 
-    def convert_many(self, sources: Iterable[str | Path]) -> list[ConversionReport]:
+    def convert_many(self, sources: Iterable[str | Path], output_dir: str | Path) -> list[ConversionReport]:
+        resolved_output_dir = self._resolve_output_dir(output_dir)
         reports: list[ConversionReport] = []
         for source in sources:
             try:
-                reports.append(self.convert_file(source))
+                reports.append(self.convert_file(source, resolved_output_dir))
             except Exception as exc:
                 src = Path(source)
                 report = ConversionReport(
                     source=src,
-                    output_markdown=self._target_markdown_path(src),
+                    output_markdown=self._target_markdown_path(src, resolved_output_dir),
                     status="error",
                     notes=[str(exc)],
                 )
@@ -120,7 +124,7 @@ class DoclingMarkdownConverter:
             }
             for r in reports
         ]
-        (self.output_dir / "conversion_summary.json").write_text(
+        (resolved_output_dir / "conversion_summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -140,12 +144,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     converter = DoclingMarkdownConverter(
-        output_dir=Path(args.output_dir),
         do_ocr=args.ocr,
         force_full_page_ocr=args.force_full_page_ocr,
         abort_on_error=not args.continue_on_error,
     )
-    reports = converter.convert_many(args.inputs)
+    reports = converter.convert_many(args.inputs, output_dir=Path(args.output_dir))
     for report in reports:
         print(f"[{report.status}] {report.source.name} -> {report.output_markdown}")
         for note in report.notes:

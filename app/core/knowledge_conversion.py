@@ -9,6 +9,9 @@ from pathlib import Path
 from app.core.knowledge_fs import DOCLING_KNOWLEDGE_EXTENSIONS, knowledge_file_extension
 
 
+_DEFAULT_DOCLING_CONVERTER = None
+
+
 class KnowledgeConversionError(RuntimeError):
     pass
 
@@ -44,9 +47,17 @@ def _load_docling_converter_class():
     return converter_cls
 
 
-def _convert_with_docling(filename: str, content: bytes) -> bytes:
-    converter_cls = _load_docling_converter_class()
+def _get_default_docling_converter():
+    global _DEFAULT_DOCLING_CONVERTER
 
+    if _DEFAULT_DOCLING_CONVERTER is None:
+        converter_cls = _load_docling_converter_class()
+        _DEFAULT_DOCLING_CONVERTER = converter_cls()
+
+    return _DEFAULT_DOCLING_CONVERTER
+
+
+def _convert_with_docling(filename: str, content: bytes) -> bytes:
     with tempfile.TemporaryDirectory() as tmp_dir_name:
         tmp_dir = Path(tmp_dir_name)
         source_path = tmp_dir / filename
@@ -54,8 +65,8 @@ def _convert_with_docling(filename: str, content: bytes) -> bytes:
         source_path.write_bytes(content)
 
         try:
-            converter = converter_cls(output_dir=output_dir)
-            report = converter.convert_file(source_path)
+            converter = _get_default_docling_converter()
+            report = converter.convert_file(source_path, output_dir=output_dir)
         except RuntimeError as exc:
             raise KnowledgeConversionDependencyError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001

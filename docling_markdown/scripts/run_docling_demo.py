@@ -29,12 +29,11 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     files = [input_dir / name for name in DEFAULT_FILES]
     converter = DoclingMarkdownConverter(
-        output_dir=output_dir,
         do_ocr=args.ocr,
         force_full_page_ocr=args.force_full_page_ocr,
         abort_on_error=not args.continue_on_error,
     )
-    reports = converter.convert_many(files)
+    reports = converter.convert_many(files, output_dir=output_dir)
     print("\nConversion results")
     print("-" * 72)
     for report in reports:
