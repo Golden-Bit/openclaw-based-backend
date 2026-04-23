@@ -5,6 +5,7 @@ import errno
 import hashlib
 import os
 import shutil
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,12 +16,22 @@ from fastapi.responses import FileResponse
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.core.agent_ownership import is_agent_id_owned_by_user, resolve_requested_agent_id_for_user
 from app.core.config import settings
+from app.core.knowledge_conversion import (
+    KnowledgeConversionDependencyError,
+    KnowledgeConversionError,
+    render_markdown_for_knowledge_upload,
+)
 from app.core.knowledge_fs import (
+    ALLOWED_KNOWLEDGE_EXTENSIONS,
     KnowledgePathError,
+    atomic_delete_files,
+    atomic_write_files,
     detect_mime_from_name,
     ensure_root_dir,
     knowledge_root_for_workspace,
     normalize_relative_path,
+    plan_knowledge_mutation,
+    plan_knowledge_write,
     reject_hardlinked_file,
     reject_symlink_chain,
     resolve_under_root,
@@ -43,9 +54,6 @@ from app.schemas.knowledge import (
 )
 
 router = APIRouter(prefix="/agents/{agent_id}/knowledge")
-
-ALLOWED_EXTENSIONS = {".md", ".txt", ".json", ".csv"}
-
 
 def _sanitize_filename(name: str) -> str:
     cleaned = os.path.basename((name or "").strip().replace("\\", "/"))
@@ -299,6 +307,102 @@ def _file_write_result(aid: str, rel: str, target: Path, content: bytes, mime_ty
     )
 
 
+@dataclass(frozen=True)
+class _PreparedKnowledgeWrite:
+    response_rel: str
+    response_target: Path
+    writes: list[tuple[Path, bytes]]
+
+
+def _join_rel(folder_rel: str, filename: str) -> str:
+    return f"{folder_rel}/{filename}" if folder_rel else filename
+
+
+MANAGED_MARKDOWN_WRITE_DETAIL = "Generated markdown siblings are managed by their paired original upload"
+
+
+def _folder_rel_for_file_rel(file_rel: str) -> str:
+    folder_rel = normalize_relative_path(str(Path(file_rel).parent).replace("\\", "/"), allow_empty=True)
+    return "" if folder_rel == "." else folder_rel
+
+
+def _delete_targets_for_file(root: Path, file_rel: str, target: Path) -> list[tuple[str, Path]]:
+    plan = plan_knowledge_mutation(target.parent, target.name)
+    folder_rel = _folder_rel_for_file_rel(file_rel)
+    delete_targets: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+
+    for filename in plan.delete_filenames:
+        candidate_rel = _join_rel(folder_rel, filename)
+        resolved_rel, resolved_target = _resolve_file(root, candidate_rel)
+        if resolved_rel in seen:
+            continue
+        seen.add(resolved_rel)
+        delete_targets.append((resolved_rel, resolved_target))
+
+    return delete_targets
+
+
+def _prepare_knowledge_write(root: Path, folder_rel: str, filename: str, data: bytes) -> tuple[_PreparedKnowledgeWrite, Path]:
+    requested_rel = _join_rel(folder_rel, filename)
+    _requested_rel, requested_target = _resolve_file(root, requested_rel)
+
+    plan = plan_knowledge_write(requested_target.parent, requested_target.name)
+
+    response_rel = _join_rel(folder_rel, plan.original_filename)
+    response_rel, response_target = _resolve_file(root, response_rel)
+
+    writes: list[tuple[Path, bytes]] = [(response_target, data)]
+    if plan.stores_generated_markdown:
+        markdown_rel = _join_rel(folder_rel, plan.markdown_filename or "")
+        _markdown_rel, markdown_target = _resolve_file(root, markdown_rel)
+        markdown_bytes = render_markdown_for_knowledge_upload(plan.original_filename, data)
+        writes.append((markdown_target, markdown_bytes))
+
+    return _PreparedKnowledgeWrite(response_rel=response_rel, response_target=response_target, writes=writes), requested_target
+
+
+def _ensure_write_target_ok(target: Path, *, detail: str) -> None:
+    if target.exists() and target.is_dir():
+        raise HTTPException(status_code=409, detail=detail)
+    if target.exists():
+        reject_hardlinked_file(target)
+
+
+def _store_knowledge_file(
+    root: Path,
+    folder_rel: str,
+    filename: str,
+    data: bytes,
+    *,
+    allow_overwrite: bool,
+    allow_create: bool,
+    exists_detail: str,
+    missing_detail: str,
+) -> tuple[str, Path]:
+    requested_rel = _join_rel(folder_rel, filename)
+    _requested_rel, requested_target = _resolve_file(root, requested_rel)
+
+    mutation_plan = plan_knowledge_mutation(requested_target.parent, requested_target.name)
+    if mutation_plan.is_managed_markdown:
+        raise HTTPException(status_code=409, detail=MANAGED_MARKDOWN_WRITE_DETAIL)
+
+    if requested_target.exists() and requested_target.is_dir():
+        raise HTTPException(status_code=409, detail="Destination path is a folder")
+    if requested_target.exists() and not allow_overwrite:
+        raise HTTPException(status_code=409, detail=exists_detail)
+    if not requested_target.exists() and not allow_create:
+        raise HTTPException(status_code=404, detail=missing_detail)
+
+    prepared, _ = _prepare_knowledge_write(root, folder_rel, filename, data)
+    for target, _content in prepared.writes:
+        detail = "Destination path is a folder" if target == prepared.response_target else "Generated markdown path is a folder"
+        _ensure_write_target_ok(target, detail=detail)
+
+    atomic_write_files(prepared.writes)
+    return prepared.response_rel, prepared.response_target
+
+
 @router.post("/files/upload", response_model=KnowledgeFileMutationResponse, summary="Upload multipart file in knowledge")
 async def upload_file(
     agent_id: str,
@@ -312,26 +416,30 @@ async def upload_file(
     try:
         folder_rel = normalize_relative_path(path, allow_empty=True)
         final_name = _sanitize_filename(filename or file.filename or "")
-        validate_allowed_extension(final_name, ALLOWED_EXTENSIONS)
-
-        rel = f"{folder_rel}/{final_name}" if folder_rel else final_name
-        rel, target = _resolve_file(root, rel)
+        validate_allowed_extension(final_name, ALLOWED_KNOWLEDGE_EXTENSIONS)
 
         data = await file.read()
         _ensure_size_ok(len(data))
 
-        if target.exists() and target.is_dir():
-            raise HTTPException(status_code=409, detail="Destination path is a folder")
-        if target.exists() and not overwrite:
-            raise HTTPException(status_code=409, detail="File already exists; set overwrite=true")
+        rel, target = _store_knowledge_file(
+            root,
+            folder_rel,
+            final_name,
+            data,
+            allow_overwrite=overwrite,
+            allow_create=True,
+            exists_detail="File already exists; set overwrite=true",
+            missing_detail="",
+        )
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-
-        mime_type = (file.content_type or "").strip() or detect_mime_from_name(final_name)
+        mime_type = (file.content_type or "").strip() or detect_mime_from_name(target.name)
         return _file_write_result(aid, rel, target, data, mime_type)
     except HTTPException:
         raise
+    except KnowledgeConversionDependencyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except KnowledgeConversionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise _map_path_error(e)
 
@@ -346,28 +454,32 @@ async def upload_file_base64(
     try:
         folder_rel = normalize_relative_path(body.path, allow_empty=True)
         final_name = _sanitize_filename(body.filename)
-        validate_allowed_extension(final_name, ALLOWED_EXTENSIONS)
-
-        rel = f"{folder_rel}/{final_name}" if folder_rel else final_name
-        rel, target = _resolve_file(root, rel)
+        validate_allowed_extension(final_name, ALLOWED_KNOWLEDGE_EXTENSIONS)
 
         data = base64.b64decode(body.content_base64, validate=True)
         _ensure_size_ok(len(data))
 
-        if target.exists() and target.is_dir():
-            raise HTTPException(status_code=409, detail="Destination path is a folder")
-        if target.exists() and not body.overwrite:
-            raise HTTPException(status_code=409, detail="File already exists; set overwrite=true")
+        rel, target = _store_knowledge_file(
+            root,
+            folder_rel,
+            final_name,
+            data,
+            allow_overwrite=body.overwrite,
+            allow_create=True,
+            exists_detail="File already exists; set overwrite=true",
+            missing_detail="",
+        )
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-
-        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(final_name)
+        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(target.name)
         return _file_write_result(aid, rel, target, data, mime_type)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
     except HTTPException:
         raise
+    except KnowledgeConversionDependencyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except KnowledgeConversionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise _map_path_error(e)
 
@@ -381,18 +493,23 @@ async def replace_file(
     aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_file(root, body.path)
-        validate_allowed_extension(target.name, ALLOWED_EXTENSIONS)
+        validate_allowed_extension(target.name, ALLOWED_KNOWLEDGE_EXTENSIONS)
 
         data = base64.b64decode(body.content_base64, validate=True)
         _ensure_size_ok(len(data))
 
-        if target.exists() and target.is_dir():
-            raise HTTPException(status_code=409, detail="Destination path is a folder")
-        if not target.exists() and not body.upsert:
-            raise HTTPException(status_code=404, detail="File not found; set upsert=true to create it")
+        folder_rel = _folder_rel_for_file_rel(rel)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        rel, target = _store_knowledge_file(
+            root,
+            folder_rel,
+            target.name,
+            data,
+            allow_overwrite=True,
+            allow_create=body.upsert,
+            exists_detail="",
+            missing_detail="File not found; set upsert=true to create it",
+        )
 
         mime_type = (body.mime_type or "").strip() or detect_mime_from_name(target.name)
         return _file_write_result(aid, rel, target, data, mime_type)
@@ -400,6 +517,10 @@ async def replace_file(
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
     except HTTPException:
         raise
+    except KnowledgeConversionDependencyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except KnowledgeConversionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise _map_path_error(e)
 
@@ -413,9 +534,22 @@ async def delete_file(
     aid, _ws, _workspace, root = await _agent_context(agent_id, user)
     try:
         rel, target = _resolve_file(root, path)
-        if not target.exists() or not target.is_file():
+        delete_targets = _delete_targets_for_file(root, rel, target)
+
+        requested_exists = False
+        existing_targets: list[Path] = []
+        for delete_rel, delete_target in delete_targets:
+            exists_as_file = delete_target.exists() and delete_target.is_file()
+            if delete_rel == rel:
+                requested_exists = exists_as_file
+            if exists_as_file:
+                reject_hardlinked_file(delete_target)
+                existing_targets.append(delete_target)
+
+        if not requested_exists:
             raise FileNotFoundError(str(target))
-        target.unlink()
+
+        atomic_delete_files(existing_targets)
     except Exception as e:  # noqa: BLE001
         raise _map_path_error(e)
 

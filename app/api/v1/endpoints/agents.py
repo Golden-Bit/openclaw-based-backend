@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.core.agent_document_skill import ensure_document_skill_for_agent
+from app.core.agent_file_reference_skill import ensure_file_reference_skill_for_agent
+from app.core.agent_response_language_skill import ensure_response_language_skill_for_agent
 from app.core.agent_ownership import (
     build_user_scoped_agent_id,
     is_agent_id_owned_by_user,
@@ -373,29 +376,50 @@ async def create_agent(
         agent_id,
     )
 
+    expected_skill_paths = [
+        f"{effective_workspace.rstrip('/')}/skills/share-files/SKILL.md",
+        f"{effective_workspace.rstrip('/')}/skills/file-reference-disambiguation/SKILL.md",
+        f"{effective_workspace.rstrip('/')}/skills/response-language/SKILL.md",
+        f"{effective_workspace.rstrip('/')}/skills/document-creation-and-manipulation/SKILL.md",
+    ]
+
     try:
-        skill_path = ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)
-        logger.info(
+        for skill_name, skill_path in [
+            ("share-files", ensure_share_skill_for_agent(effective_workspace, user_id=user.user_id)),
             (
-                "agents.create share_skill bootstrap success user_id=%s agent_id=%s "
-                "effective_workspace=%s skill_file=%s"
+                "file-reference-disambiguation",
+                ensure_file_reference_skill_for_agent(effective_workspace, user_id=user.user_id),
             ),
-            user.user_id,
-            agent_id,
-            effective_workspace,
-            skill_path.as_posix(),
-        )
+            (
+                "response-language",
+                ensure_response_language_skill_for_agent(effective_workspace, user_id=user.user_id),
+            ),
+            (
+                "document-creation-and-manipulation",
+                ensure_document_skill_for_agent(effective_workspace, user_id=user.user_id),
+            ),
+        ]:
+            logger.info(
+                (
+                    "agents.create agent_skill bootstrap success user_id=%s agent_id=%s "
+                    "effective_workspace=%s skill_name=%s skill_file=%s"
+                ),
+                user.user_id,
+                agent_id,
+                effective_workspace,
+                skill_name,
+                skill_path.as_posix(),
+            )
     except Exception as skill_err:  # noqa: BLE001
-        expected_skill_path = f"{effective_workspace.rstrip('/')}/skills/share-files/SKILL.md"
         logger.exception(
             (
-                "agents.create share_skill bootstrap failed user_id=%s agent_id=%s "
-                "effective_workspace=%s expected_skill_file=%s"
+                "agents.create agent_skill bootstrap failed user_id=%s agent_id=%s "
+                "effective_workspace=%s expected_skill_files=%s"
             ),
             user.user_id,
             agent_id,
             effective_workspace,
-            expected_skill_path,
+            expected_skill_paths,
         )
 
         rollback_error: Optional[Exception] = None
@@ -408,14 +432,13 @@ async def create_agent(
         if rollback_error is None:
             raise HTTPException(
                 status_code=500,
-                detail=f"Agent created but share skill bootstrap failed; create was rolled back: {skill_err}",
+                detail="agent skill bootstrap failed",
             )
 
         raise HTTPException(
             status_code=500,
             detail=(
-                "Agent created but share skill bootstrap failed and rollback failed: "
-                f"bootstrap_error={skill_err}; rollback_error={rollback_error}"
+                "agent skill bootstrap failed"
             ),
         )
 

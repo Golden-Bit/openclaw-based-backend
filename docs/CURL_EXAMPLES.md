@@ -126,6 +126,8 @@ curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/folders" \
 
 ## Upload knowledge file (multipart)
 
+Markdown uploads stay single-file only when the target path is standalone. Non-Markdown uploads (`.txt`, `.json`, `.csv`, `.pdf`, `.docx`, `.xlsx`, `.pptx`) are stored as the original file plus a generated sibling `<stem>.md` in the same folder. If the original file already exists, the usual `overwrite=true` or `upsert=true` controls still apply; if only `<stem>.md` already exists, the backend preserves that user-authored markdown and allocates the first free incremented basename for the new managed pair. Direct upload/replace to a managed generated `<stem>.md` path returns `409`, including when the original already exists and the markdown sibling path is still reserved but missing. Deleting either member of a managed pair removes both files; deleting a standalone markdown file removes only that file.
+
 ```bash
 curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/upload" \
   -H 'X-Debug-User: dev-user' \
@@ -141,6 +143,15 @@ curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/base64
   -H 'Content-Type: application/json' \
   -H 'X-Debug-User: dev-user' \
   -d '{"path":"project-a/docs","filename":"note.md","content_base64":"IyBIZWxsbwo=","overwrite":true}' | jq
+```
+
+Example non-Markdown upload that stores both `brief.pdf` and generated `brief.md`:
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/base64" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs","filename":"brief.pdf","content_base64":"JVBERi0xLjQK","overwrite":true}' | jq
 ```
 
 ## Read knowledge file content
@@ -160,6 +171,8 @@ curl -L "http://localhost:8000/api/v1/agents/main/knowledge/files/download?path=
 
 ## Replace knowledge file content (PUT)
 
+`PUT` on `note.md` works when that markdown file is standalone. If the same path is the generated sibling of `note.txt`, `note.pdf`, `note.docx`, `note.xlsx`, `note.pptx`, `note.json`, or `note.csv`, the endpoint returns `409` and leaves the managed pair unchanged.
+
 ```bash
 curl -s -X PUT "http://localhost:8000/api/v1/agents/main/knowledge/files" \
   -H 'Content-Type: application/json' \
@@ -168,6 +181,8 @@ curl -s -X PUT "http://localhost:8000/api/v1/agents/main/knowledge/files" \
 ```
 
 ## Delete knowledge file
+
+Deleting `project-a/docs/brief.pdf` removes both `brief.pdf` and its managed generated `brief.md`. Deleting `project-a/docs/brief.md` does the same when that markdown file belongs to a managed pair. Deleting standalone `project-a/docs/note.md` removes only `note.md`.
 
 ```bash
 curl -s -X DELETE "http://localhost:8000/api/v1/agents/main/knowledge/files?path=project-a/docs/note.md" \

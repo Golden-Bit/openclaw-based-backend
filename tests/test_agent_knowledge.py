@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api.v1.endpoints import knowledge as knowledge_endpoint
+from app.core.knowledge_conversion import KnowledgeConversionError
 from app.core.security import AuthenticatedUser
 from app.schemas.knowledge import (
     KnowledgeFileBase64UploadRequest,
@@ -36,6 +37,10 @@ class _FakeWS:
 
 def _user(uid: str = "u1") -> AuthenticatedUser:
     return AuthenticatedUser(user_id=uid, claims={})
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
 
 
 def _patch_context(monkeypatch: MonkeyPatch, tmp_path: Path, ws: _FakeWS | None = None):
@@ -265,3 +270,496 @@ def test_agent_context_accepts_absolute_workspace_when_agent_id_owned(monkeypatc
     assert aid == "u1-main"
     assert workspace == foreign_workspace
     assert root.as_posix().endswith("/foreign/memory/knowledge")
+
+
+def test_upload_base64_text_file_creates_markdown_sibling(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+
+    created = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            "main",
+            KnowledgeFileBase64UploadRequest(
+                path="research",
+                filename="notes.txt",
+                content_base64=_b64(b"hello knowledge"),
+                overwrite=False,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert created.path == "research/notes.txt"
+    assert (root / "research" / "notes.txt").read_text(encoding="utf-8") == "hello knowledge"
+    assert (root / "research" / "notes.md").read_text(encoding="utf-8") == "hello knowledge"
+
+
+def test_upload_base64_pdf_creates_original_and_markdown(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+
+    def _render(filename: str, content: bytes) -> bytes:
+        assert filename == "brief.pdf"
+        assert content == b"%PDF-1.7 fake"
+        return b"# Converted brief\n"
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", _render)
+
+    created = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            "main",
+            KnowledgeFileBase64UploadRequest(
+                path="research",
+                filename="brief.pdf",
+                content_base64=_b64(b"%PDF-1.7 fake"),
+                overwrite=False,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert created.path == "research/brief.pdf"
+    assert (root / "research" / "brief.pdf").read_bytes() == b"%PDF-1.7 fake"
+    assert (root / "research" / "brief.md").read_text(encoding="utf-8") == "# Converted brief\n"
+    assert not (root / "research" / "brief.json").exists()
+    assert not (root / "research" / "conversion_summary.json").exists()
+
+
+def test_upload_base64_pdf_managed_pair_requires_overwrite(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.pdf").write_bytes(b"old-pdf")
+    (folder / "brief.md").write_text("old-md", encoding="utf-8")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Refreshed\n")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file_base64(
+                "main",
+                KnowledgeFileBase64UploadRequest(
+                    path="research",
+                    filename="brief.pdf",
+                    content_base64=_b64(b"new-pdf"),
+                    overwrite=False,
+                ),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (folder / "brief.pdf").read_bytes() == b"old-pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "old-md"
+
+    updated = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            "main",
+            KnowledgeFileBase64UploadRequest(
+                path="research",
+                filename="brief.pdf",
+                content_base64=_b64(b"new-pdf"),
+                overwrite=True,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert updated.path == "research/brief.pdf"
+    assert (folder / "brief.pdf").read_bytes() == b"new-pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# Refreshed\n"
+
+
+def test_upload_base64_pdf_sibling_only_uses_incremented_pair(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.md").write_text("user-authored", encoding="utf-8")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Generated\n")
+
+    created = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            "main",
+            KnowledgeFileBase64UploadRequest(
+                path="research",
+                filename="brief.pdf",
+                content_base64=_b64(b"fresh-pdf"),
+                overwrite=False,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert created.path == "research/brief-1.pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "user-authored"
+    assert (folder / "brief-1.pdf").read_bytes() == b"fresh-pdf"
+    assert (folder / "brief-1.md").read_text(encoding="utf-8") == "# Generated\n"
+
+
+def test_upload_base64_pdf_original_only_requires_overwrite_and_adds_markdown(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.pdf").write_bytes(b"old-pdf")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Generated\n")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file_base64(
+                "main",
+                KnowledgeFileBase64UploadRequest(
+                    path="research",
+                    filename="brief.pdf",
+                    content_base64=_b64(b"new-pdf"),
+                    overwrite=False,
+                ),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert not (folder / "brief.md").exists()
+
+    updated = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            "main",
+            KnowledgeFileBase64UploadRequest(
+                path="research",
+                filename="brief.pdf",
+                content_base64=_b64(b"new-pdf"),
+                overwrite=True,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert updated.path == "research/brief.pdf"
+    assert (folder / "brief.pdf").read_bytes() == b"new-pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# Generated\n"
+
+
+def test_replace_file_pdf_sibling_only_requires_upsert(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.md").write_text("user-authored", encoding="utf-8")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Replaced\n")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.replace_file(
+                "main",
+                KnowledgeFilePutRequest(
+                    path="research/brief.pdf",
+                    content_base64=_b64(b"new-pdf"),
+                    upsert=False,
+                ),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
+
+    created = asyncio.run(
+        knowledge_endpoint.replace_file(
+            "main",
+            KnowledgeFilePutRequest(
+                path="research/brief.pdf",
+                content_base64=_b64(b"new-pdf"),
+                upsert=True,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert created.path == "research/brief-1.pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "user-authored"
+    assert (folder / "brief-1.pdf").read_bytes() == b"new-pdf"
+    assert (folder / "brief-1.md").read_text(encoding="utf-8") == "# Replaced\n"
+
+
+def test_upload_base64_conversion_failure_does_not_write_live_files(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+
+    def _raise(_filename: str, _content: bytes) -> bytes:
+        raise KnowledgeConversionError("conversion failed")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file_base64(
+                "main",
+                KnowledgeFileBase64UploadRequest(
+                    path="research",
+                    filename="brief.pdf",
+                    content_base64=_b64(b"broken"),
+                    overwrite=False,
+                ),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 422
+    assert not (root / "research" / "brief.pdf").exists()
+    assert not (root / "research" / "brief.md").exists()
+
+
+
+def test_upload_multipart_pdf_creates_original_and_markdown(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Multipart\n")
+
+    upload = UploadFile(filename="brief.pdf", file=io.BytesIO(b"%PDF-multipart"))
+    created = asyncio.run(
+        knowledge_endpoint.upload_file(
+            "main",
+            file=upload,
+            path="research",
+            filename=None,
+            overwrite=False,
+            user=_user("u1"),
+        )
+    )
+
+    assert created.path == "research/brief.pdf"
+    assert (root / "research" / "brief.pdf").read_bytes() == b"%PDF-multipart"
+    assert (root / "research" / "brief.md").read_text(encoding="utf-8") == "# Multipart\n"
+
+
+
+def test_replace_file_existing_pdf_refreshes_original_and_markdown(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.pdf").write_bytes(b"old-pdf")
+    (folder / "brief.md").write_text("old-md", encoding="utf-8")
+
+    monkeypatch.setattr(knowledge_endpoint, "render_markdown_for_knowledge_upload", lambda _filename, _content: b"# Updated\n")
+
+    updated = asyncio.run(
+        knowledge_endpoint.replace_file(
+            "main",
+            KnowledgeFilePutRequest(
+                path="research/brief.pdf",
+                content_base64=_b64(b"new-pdf"),
+                upsert=False,
+            ),
+            _user("u1"),
+        )
+    )
+
+    assert updated.path == "research/brief.pdf"
+    assert (folder / "brief.pdf").read_bytes() == b"new-pdf"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# Updated\n"
+
+
+def test_upload_multipart_to_managed_markdown_is_rejected(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+    (folder / 'brief.md').write_text('old-md', encoding='utf-8')
+
+    def _raise(_filename: str, _content: bytes) -> bytes:
+        raise AssertionError('conversion should not run for managed markdown writes')
+
+    monkeypatch.setattr(knowledge_endpoint, 'render_markdown_for_knowledge_upload', _raise)
+
+    upload = UploadFile(filename='brief.md', file=io.BytesIO(b'user-edit'))
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file(
+                'main',
+                file=upload,
+                path='research',
+                filename=None,
+                overwrite=True,
+                user=_user('u1'),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
+    assert (folder / 'brief.md').read_text(encoding='utf-8') == 'old-md'
+
+
+
+def test_upload_multipart_to_reserved_managed_markdown_is_rejected(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+
+    def _raise(_filename: str, _content: bytes) -> bytes:
+        raise AssertionError('conversion should not run for managed markdown writes')
+
+    monkeypatch.setattr(knowledge_endpoint, 'render_markdown_for_knowledge_upload', _raise)
+
+    upload = UploadFile(filename='brief.md', file=io.BytesIO(b'user-edit'))
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file(
+                'main',
+                file=upload,
+                path='research',
+                filename=None,
+                overwrite=True,
+                user=_user('u1'),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
+    assert not (folder / 'brief.md').exists()
+
+
+
+def test_upload_base64_to_reserved_managed_markdown_is_rejected(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+
+    def _raise(_filename: str, _content: bytes) -> bytes:
+        raise AssertionError('conversion should not run for managed markdown writes')
+
+    monkeypatch.setattr(knowledge_endpoint, 'render_markdown_for_knowledge_upload', _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.upload_file_base64(
+                'main',
+                KnowledgeFileBase64UploadRequest(
+                    path='research',
+                    filename='brief.md',
+                    content_base64=_b64(b'user-edit'),
+                    overwrite=True,
+                ),
+                _user('u1'),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
+    assert not (folder / 'brief.md').exists()
+
+
+
+def test_replace_file_reserved_managed_markdown_is_rejected(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+
+    def _raise(_filename: str, _content: bytes) -> bytes:
+        raise AssertionError('conversion should not run for managed markdown writes')
+
+    monkeypatch.setattr(knowledge_endpoint, 'render_markdown_for_knowledge_upload', _raise)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.replace_file(
+                'main',
+                KnowledgeFilePutRequest(
+                    path='research/brief.md',
+                    content_base64=_b64(b'user-edit'),
+                    upsert=True,
+                ),
+                _user('u1'),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
+    assert not (folder / 'brief.md').exists()
+
+
+
+def test_standalone_markdown_still_uploads_replaces_and_deletes(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+
+    created = asyncio.run(
+        knowledge_endpoint.upload_file_base64(
+            'main',
+            KnowledgeFileBase64UploadRequest(
+                path='research',
+                filename='note.md',
+                content_base64=_b64(b'first version'),
+                overwrite=False,
+            ),
+            _user('u1'),
+        )
+    )
+    assert created.path == 'research/note.md'
+    assert (root / 'research' / 'note.md').read_text(encoding='utf-8') == 'first version'
+
+    updated = asyncio.run(
+        knowledge_endpoint.replace_file(
+            'main',
+            KnowledgeFilePutRequest(
+                path='research/note.md',
+                content_base64=_b64(b'second version'),
+                upsert=False,
+            ),
+            _user('u1'),
+        )
+    )
+    assert updated.path == 'research/note.md'
+    assert (root / 'research' / 'note.md').read_text(encoding='utf-8') == 'second version'
+
+    deleted = asyncio.run(knowledge_endpoint.delete_file('main', path='research/note.md', user=_user('u1')))
+    assert deleted.deleted is True
+    assert not (root / 'research' / 'note.md').exists()
+
+
+
+def test_delete_original_file_removes_managed_markdown_sibling(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+    (folder / 'brief.md').write_text('old-md', encoding='utf-8')
+
+    deleted = asyncio.run(knowledge_endpoint.delete_file('main', path='research/brief.pdf', user=_user('u1')))
+
+    assert deleted.deleted is True
+    assert deleted.path == 'research/brief.pdf'
+    assert not (folder / 'brief.pdf').exists()
+    assert not (folder / 'brief.md').exists()
+
+
+
+def test_delete_generated_markdown_removes_managed_original_sibling(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+    (folder / 'brief.md').write_text('old-md', encoding='utf-8')
+
+    deleted = asyncio.run(knowledge_endpoint.delete_file('main', path='research/brief.md', user=_user('u1')))
+
+    assert deleted.deleted is True
+    assert deleted.path == 'research/brief.md'
+    assert not (folder / 'brief.pdf').exists()
+    assert not (folder / 'brief.md').exists()
+
+
+
+def test_delete_standalone_markdown_removes_only_that_file(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'note.md').write_text('standalone', encoding='utf-8')
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+    (folder / 'brief.md').write_text('managed', encoding='utf-8')
+
+    deleted = asyncio.run(knowledge_endpoint.delete_file('main', path='research/note.md', user=_user('u1')))
+
+    assert deleted.deleted is True
+    assert deleted.path == 'research/note.md'
+    assert not (folder / 'note.md').exists()
+    assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
+    assert (folder / 'brief.md').read_text(encoding='utf-8') == 'managed'

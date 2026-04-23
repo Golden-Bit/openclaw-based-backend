@@ -62,6 +62,10 @@ Il servizio integra:
 - `GET /api/v1/agents/{agent_id}/knowledge/files/download`
 - `POST /api/v1/agents/{agent_id}/knowledge/reindex`
 
+Knowledge uploads support `.md`, `.txt`, `.json`, `.csv`, `.pdf`, `.docx`, `.xlsx`, and `.pptx`.
+Markdown uploads are stored exactly as uploaded when the target path is standalone. Every other supported type is stored as the original file plus a generated sibling markdown file named `<stem>.md` in the same folder.
+If a standalone `<stem>.md` already exists without the matching original upload, the backend preserves that user-authored markdown and allocates the first incremented basename for the new managed pair (for example `brief-1.pdf` + `brief-1.md`). Existing original uploads still follow the current `overwrite=true` / `upsert=true` semantics, and refreshing a managed pair updates both the original file and its generated markdown sibling. Direct upload/replace to a managed generated `<stem>.md` path is rejected with `409 Conflict`, including when the original exists and the markdown sibling is still missing because that path is reserved for the managed pair. Deleting either member of a managed pair removes both files, while standalone user-authored markdown files still upload, replace, and delete normally. Read/download operations remain path-based on the specific file you request.
+
 #### Shared File Hosting
 - `GET /shared/files/{path}` (public hosting da filesystem backend)
 
@@ -191,8 +195,9 @@ Per deployment dietro dominio/proxy:
 - Namespace utente per workspace è hash-only (`u-<hash>`), con fallback legacy opzionale controllato da `AGENT_NAMESPACE_ALLOW_LEGACY`.
 - In lista agenti, campi come `name/workspace/model` possono risultare `null` se non valorizzati o non restituiti dal gateway OpenClaw per quello specifico agente.
 - Endpoint knowledge usano filesystem locale workspace agente (`<workspace>/memory/knowledge`) con path safety strict (niente traversal/assoluti/symlink escape) e visibilità limitata agli agenti nel namespace workspace dell'utente autenticato.
+- Per upload knowledge: `.md` resta single-file solo se standalone; `.txt`, `.json`, `.csv`, `.pdf`, `.docx`, `.xlsx` e `.pptx` vengono salvati come coppia file originale + sibling markdown generato (`<stem>.md`) nella stessa cartella. Upload/replace diretti verso un `.md` generato gestito sono rifiutati con `409`, e la delete di uno dei due membri rimuove entrambi i file della coppia.
 - Rotta shared hosting serve file da `SHARED_FILES_ROOT` (supporta sottocartelle), senza listing directory e con blocco traversal/symlink.
-- Quando crei un agente, il backend crea automaticamente `skills/share-files/SKILL.md` nel workspace agente con istruzioni su path condiviso e formato link markdown da usare in chat.
+- Quando crei un agente, il backend crea automaticamente `skills/share-files/SKILL.md`, `skills/file-reference-disambiguation/SKILL.md`, `skills/response-language/SKILL.md` e `skills/document-creation-and-manipulation/SKILL.md` nel workspace agente. La prima skill spiega come pubblicare file condivisi scaricabili; la seconda spiega come trattare i link di download passati in chat dall’utente come file allegati da scaricare nel workspace prima di usarli, assumendo per default l’ultimo file caricato/citato se l’utente non ne specifica un altro; la terza impone di rispondere nella stessa lingua dell’ultimo messaggio utente, usando la lingua dominante se l’input è quasi tutto in una lingua sola e chiedendo un chiarimento breve solo se l’input è davvero ambiguo o misto; la quarta spiega come creare e manipolare documenti professionali scegliendo la libreria Python più adatta al formato e usando script temporanei da eliminare quando non servono più.
 
 ## Script utili
 

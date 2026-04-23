@@ -41,16 +41,49 @@ def _patch_ws(monkeypatch: MonkeyPatch, ws: _FakeWS):
     monkeypatch.setattr(agents_endpoint, "_get_connected_ws", _get_connected_ws)
 
 
-def _patch_skill_bootstrap(monkeypatch: MonkeyPatch, *, fail: bool = False):
-    calls: list[tuple[str, str]] = []
+def _patch_skill_bootstraps(monkeypatch: MonkeyPatch, *, fail_skill: str | None = None):
+    calls: list[tuple[str, str, str]] = []
 
     def _ensure_share_skill_for_agent(workspace: str, *, user_id: str):
-        calls.append((workspace, user_id))
-        if fail:
+        calls.append(("share-files", workspace, user_id))
+        if fail_skill == "share-files":
             raise RuntimeError("bootstrap failed")
         return Path(workspace) / "skills" / "share-files" / "SKILL.md"
 
+    def _ensure_file_reference_skill_for_agent(workspace: str, *, user_id: str):
+        calls.append(("file-reference-disambiguation", workspace, user_id))
+        if fail_skill == "file-reference-disambiguation":
+            raise RuntimeError("bootstrap failed")
+        return Path(workspace) / "skills" / "file-reference-disambiguation" / "SKILL.md"
+
+    def _ensure_response_language_skill_for_agent(workspace: str, *, user_id: str):
+        calls.append(("response-language", workspace, user_id))
+        if fail_skill == "response-language":
+            raise RuntimeError("bootstrap failed")
+        return Path(workspace) / "skills" / "response-language" / "SKILL.md"
+
+    def _ensure_document_skill_for_agent(workspace: str, *, user_id: str):
+        calls.append(("document-creation-and-manipulation", workspace, user_id))
+        if fail_skill == "document-creation-and-manipulation":
+            raise RuntimeError("bootstrap failed")
+        return Path(workspace) / "skills" / "document-creation-and-manipulation" / "SKILL.md"
+
     monkeypatch.setattr(agents_endpoint, "ensure_share_skill_for_agent", _ensure_share_skill_for_agent)
+    monkeypatch.setattr(
+        agents_endpoint,
+        "ensure_file_reference_skill_for_agent",
+        _ensure_file_reference_skill_for_agent,
+    )
+    monkeypatch.setattr(
+        agents_endpoint,
+        "ensure_response_language_skill_for_agent",
+        _ensure_response_language_skill_for_agent,
+    )
+    monkeypatch.setattr(
+        agents_endpoint,
+        "ensure_document_skill_for_agent",
+        _ensure_document_skill_for_agent,
+    )
     return calls
 
 
@@ -154,7 +187,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
         }
     )
     _patch_ws(monkeypatch, ws)
-    skill_calls = _patch_skill_bootstrap(monkeypatch)
+    skill_calls = _patch_skill_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -171,13 +204,18 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
         (
             "agents.create",
             {
-                "name": "Agent 1",
+                "name": expected_agent_id,
                 "workspace": expected_ws,
                 "emoji": "🤖",
             },
         )
     ]
-    assert skill_calls == [("/tmp/a1", "u1")]
+    assert skill_calls == [
+        ("share-files", "/tmp/a1", "u1"),
+        ("file-reference-disambiguation", "/tmp/a1", "u1"),
+        ("response-language", "/tmp/a1", "u1"),
+        ("document-creation-and-manipulation", "/tmp/a1", "u1"),
+    ]
 
 
 def test_create_agent_uses_user_scoped_id_even_with_long_input(monkeypatch: MonkeyPatch):
@@ -185,7 +223,7 @@ def test_create_agent_uses_user_scoped_id_even_with_long_input(monkeypatch: Monk
     scoped = build_user_scoped_agent_id("u1", long_name)
     ws = _FakeWS(responses={"agents.create": {"ok": True, "agentId": scoped, "workspace": normalize_workspace_for_user("u1", "a1")}})
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstrap(monkeypatch)
+    _ = _patch_skill_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -211,7 +249,7 @@ def test_create_agent_falls_back_to_requested_plain_name_when_gateway_omits_name
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstrap(monkeypatch)
+    _ = _patch_skill_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -226,7 +264,7 @@ def test_create_agent_falls_back_to_requested_plain_name_when_gateway_omits_name
         (
             "agents.create",
             {
-                "name": requested_name,
+                "name": scoped,
                 "workspace": normalize_workspace_for_user("u1", "a1"),
             },
         )
@@ -247,7 +285,7 @@ def test_create_agent_returns_requested_plain_name_even_when_gateway_echoes_scop
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstrap(monkeypatch)
+    _ = _patch_skill_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -269,7 +307,7 @@ def test_create_agent_rolls_back_when_returned_agent_id_is_not_owned(monkeypatch
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstrap(monkeypatch)
+    _ = _patch_skill_bootstraps(monkeypatch)
 
     with pytest.raises(HTTPException) as exc_info:
         _ = asyncio.run(
@@ -312,7 +350,7 @@ def test_create_agent_rolls_back_when_skill_bootstrap_fails(monkeypatch: MonkeyP
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstrap(monkeypatch, fail=True)
+    skill_calls = _patch_skill_bootstraps(monkeypatch, fail_skill="document-creation-and-manipulation")
 
     with pytest.raises(HTTPException) as exc_info:
         _ = asyncio.run(
@@ -323,6 +361,13 @@ def test_create_agent_rolls_back_when_skill_bootstrap_fails(monkeypatch: MonkeyP
         )
 
     assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "agent skill bootstrap failed"
+    assert skill_calls == [
+        ("share-files", normalize_workspace_for_user("u1", "a2"), "u1"),
+        ("file-reference-disambiguation", normalize_workspace_for_user("u1", "a2"), "u1"),
+        ("response-language", normalize_workspace_for_user("u1", "a2"), "u1"),
+        ("document-creation-and-manipulation", normalize_workspace_for_user("u1", "a2"), "u1"),
+    ]
     assert ws.calls[0][0] == "agents.create"
     assert ws.calls[1] == ("agents.delete", {"agentId": scoped_id, "deleteFiles": True})
 

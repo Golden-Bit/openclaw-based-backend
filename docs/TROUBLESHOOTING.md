@@ -186,13 +186,14 @@
 
 ---
 
-## `500` in creazione agente con messaggio su "share skill bootstrap failed"
+## `500` in creazione agente con messaggio su "agent skill bootstrap failed"
 
 ### Causa
-- il backend non riesce a creare `skills/share-files/SKILL.md` nel workspace agente
+- il backend non riesce a creare una delle skill bootstrap del workspace agente
+- i path attesi sono `skills/share-files/SKILL.md`, `skills/file-reference-disambiguation/SKILL.md`, `skills/response-language/SKILL.md` e `skills/document-creation-and-manipulation/SKILL.md` (la seconda skill istruisce l’agente a trattare i link upload passati in chat come file da scaricare nel workspace e a usare per default l’ultimo file caricato/citato se l’utente non specifica altro; la terza impone di rispondere nella stessa lingua dell’ultimo messaggio utente, usando la lingua dominante se l’input è quasi tutto in una lingua sola e chiedendo un chiarimento breve solo se l’input è davvero ambiguo o misto; la quarta guida la creazione e manipolazione di documenti professionali con librerie Python adatte al formato e script temporanei da rimuovere a fine lavoro)
 - tipicamente permessi filesystem o path workspace non scrivibile
 
 ### Verifica/Fix
 - verifica permessi write sul workspace agente
 - verifica `SHARED_FILES_ROOT`, `SHARED_FILES_URL_PREFIX`, `BFF_PUBLIC_BASE_URL`
-- se necessario crea manualmente `skills/share-files/` nel workspace e riprova
+- se necessario crea manualmente `skills/share-files/`, `skills/file-reference-disambiguation/`, `skills/response-language/` e `skills/document-creation-and-manipulation/` nel workspace e riprova

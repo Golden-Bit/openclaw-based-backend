@@ -84,7 +84,7 @@ Endpoint utili:
 - Agent knowledge tree: `http://localhost:8000/api/v1/agents/main/knowledge/tree`
 - Shared hosted file (esempio): `http://localhost:8000/shared/files/public/example.txt`
 
-Nota: alla creazione agente, il backend scrive automaticamente `skills/share-files/SKILL.md` nel workspace agente.
+Nota: alla creazione agente, il backend scrive automaticamente `skills/share-files/SKILL.md`, `skills/file-reference-disambiguation/SKILL.md`, `skills/response-language/SKILL.md` e `skills/document-creation-and-manipulation/SKILL.md` nel workspace agente.
 
 ## 5) Test
 
