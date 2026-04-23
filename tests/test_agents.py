@@ -148,7 +148,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
             "agents.create": {
                 "ok": True,
                 "agentId": expected_agent_id,
-                "name": expected_agent_id,
+                "name": "Agent 1",
                 "workspace": "/tmp/a1",
             }
         }
@@ -165,13 +165,13 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
 
     assert res.created is True
     assert res.agent_id == expected_agent_id
-    assert res.name == expected_agent_id
+    assert res.name == "Agent 1"
     assert res.workspace == "/tmp/a1"
     assert ws.calls == [
         (
             "agents.create",
             {
-                "name": expected_agent_id,
+                "name": "Agent 1",
                 "workspace": expected_ws,
                 "emoji": "🤖",
             },
@@ -196,6 +196,68 @@ def test_create_agent_uses_user_scoped_id_even_with_long_input(monkeypatch: Monk
 
     assert len(res.agent_id or "") <= 64
     assert (res.agent_id or "").startswith("u1-")
+
+
+def test_create_agent_falls_back_to_requested_plain_name_when_gateway_omits_name(monkeypatch: MonkeyPatch):
+    requested_name = "Agent Plain"
+    scoped = build_user_scoped_agent_id("u1", requested_name)
+    ws = _FakeWS(
+        responses={
+            "agents.create": {
+                "ok": True,
+                "agentId": scoped,
+                "workspace": normalize_workspace_for_user("u1", "a1"),
+            }
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+    _ = _patch_skill_bootstrap(monkeypatch)
+
+    res = asyncio.run(
+        agents_endpoint.create_agent(
+            AgentCreateRequest(name=requested_name, workspace="a1"),
+            _user("u1"),
+        )
+    )
+
+    assert res.agent_id == scoped
+    assert res.name == requested_name
+    assert ws.calls == [
+        (
+            "agents.create",
+            {
+                "name": requested_name,
+                "workspace": normalize_workspace_for_user("u1", "a1"),
+            },
+        )
+    ]
+
+
+def test_create_agent_returns_requested_plain_name_even_when_gateway_echoes_scoped_name(monkeypatch: MonkeyPatch):
+    requested_name = "Agent Plain"
+    scoped = build_user_scoped_agent_id("u1", requested_name)
+    ws = _FakeWS(
+        responses={
+            "agents.create": {
+                "ok": True,
+                "agentId": scoped,
+                "name": scoped,
+                "workspace": normalize_workspace_for_user("u1", "a1"),
+            }
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+    _ = _patch_skill_bootstrap(monkeypatch)
+
+    res = asyncio.run(
+        agents_endpoint.create_agent(
+            AgentCreateRequest(name=requested_name, workspace="a1"),
+            _user("u1"),
+        )
+    )
+
+    assert res.agent_id == scoped
+    assert res.name == requested_name
 
 
 def test_create_agent_rolls_back_when_returned_agent_id_is_not_owned(monkeypatch: MonkeyPatch):

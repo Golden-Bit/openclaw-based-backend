@@ -40,10 +40,22 @@ def _workspace_bases_as_posix(user_id: str) -> list[str]:
 
 
 def _resolve_requested_agent_id_or_400(user: AuthenticatedUser, requested_agent_id: str) -> str:
+    raw = (requested_agent_id or "").strip().lower()
+    if not raw:
+        raise HTTPException(status_code=400, detail="agent_id is required")
+    return raw
+
+
+def _candidate_agent_ids_for_request(user: AuthenticatedUser, requested_agent_id: str) -> list[str]:
+    resolved_raw = _resolve_requested_agent_id_or_400(user, requested_agent_id)
+    candidates = [resolved_raw]
     try:
-        return resolve_requested_agent_id_for_user(user.user_id, requested_agent_id)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        scoped = resolve_requested_agent_id_for_user(user.user_id, resolved_raw)
+        if scoped not in candidates:
+            candidates.append(scoped)
+    except ValueError:
+        pass
+    return candidates
 
 
 def _log_agents_list_raw(*, context: str, payload: Any) -> None:
@@ -98,7 +110,26 @@ async def _get_connected_ws():
     return ws
 
 
-def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> AgentSummary:
+def _friendly_agent_name_for_user(user_id: str | None, raw_name: Any, agent_id: str) -> Optional[str]:
+    name: Optional[str] = str(raw_name).strip() if isinstance(raw_name, str) and str(raw_name).strip() else None
+    if not user_id:
+        return name
+
+    prefix = f"{user_agent_id_prefix(user_id)}-"
+    if name and name.lower().startswith(prefix):
+        trimmed = name[len(prefix) :].strip()
+        if trimmed:
+            return trimmed
+
+    if (not name) and agent_id and agent_id.lower().startswith(prefix):
+        trimmed = agent_id[len(prefix) :].strip()
+        if trimmed:
+            return trimmed
+
+    return name
+
+
+def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str, user_id: str | None = None) -> AgentSummary:
     model_raw = raw.get("model")
     identity_raw = raw.get("identity")
 
@@ -118,14 +149,15 @@ def _normalize_agent_summary(raw: Dict[str, Any], *, default_agent_id: str) -> A
             model_fallbacks = cleaned or None
 
     agent_id = str(raw.get("id") or "").strip().lower()
-    name = raw.get("name")
-    if (not isinstance(name, str) or not name.strip()) and isinstance(identity_raw, dict):
-        name = identity_raw.get("name")
+    name_raw = raw.get("name")
+    if (not isinstance(name_raw, str) or not name_raw.strip()) and isinstance(identity_raw, dict):
+        name_raw = identity_raw.get("name")
     workspace = raw.get("workspace")
+    display_name = _friendly_agent_name_for_user(user_id, name_raw, agent_id)
 
     return AgentSummary(
         agent_id=agent_id,
-        name=(str(name).strip() if isinstance(name, str) and name.strip() else None),
+        name=display_name,
         workspace=(str(workspace).strip() if isinstance(workspace, str) and workspace.strip() else None),
         model=model,
         model_fallbacks=model_fallbacks,
@@ -140,29 +172,62 @@ def _workspace_from_raw_agent(raw: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _enforce_agent_ownership_or_404(user: AuthenticatedUser, raw_agent: Dict[str, Any], *, requested_agent_id: str) -> str:
-    workspace = _workspace_from_raw_agent(raw_agent)
-    selected_agent_id = str(raw_agent.get("id") or "").strip().lower()
-    owned = is_agent_id_owned_by_user(user.user_id, selected_agent_id)
+async def _workspace_from_files_list(ws, agent_id: str) -> Optional[str]:
+    if not agent_id:
+        return None
+    try:
+        files_payload = await ws.call("agents.files.list", {"agentId": agent_id})
+    except Exception as e:  # noqa: BLE001
+        logger.info("agents.workspace resolve via files.list failed agent_id=%s error=%s", agent_id, e)
+        return None
+    if isinstance(files_payload, dict):
+        workspace = files_payload.get("workspace")
+        if isinstance(workspace, str) and workspace.strip():
+            return workspace.strip()
+    return None
 
-    if not owned:
+
+async def _resolve_agent_ownership(ws, user: AuthenticatedUser, raw_agent: Dict[str, Any]) -> tuple[str, Optional[str], bool, bool, bool]:
+    selected_agent_id = str(raw_agent.get("id") or "").strip().lower()
+    workspace = _workspace_from_raw_agent(raw_agent)
+    owned_by_id = is_agent_id_owned_by_user(user.user_id, selected_agent_id)
+    if not workspace and selected_agent_id:
+        workspace = await _workspace_from_files_list(ws, selected_agent_id)
+    owned_by_workspace = is_workspace_owned_by_user(user.user_id, workspace)
+    allowed = owned_by_id or owned_by_workspace
+    return selected_agent_id, workspace, owned_by_id, owned_by_workspace, allowed
+
+
+async def _enforce_agent_ownership_or_404(
+    ws,
+    user: AuthenticatedUser,
+    raw_agent: Dict[str, Any],
+    *,
+    requested_agent_id: str,
+) -> tuple[str, Optional[str]]:
+    selected_agent_id, workspace, owned_by_id, owned_by_workspace, allowed = await _resolve_agent_ownership(ws, user, raw_agent)
+
+    if not allowed:
         logger.warning(
             (
                 "agents.ownership denied user_id=%s requested_agent_id=%s selected_agent_id=%s "
-                "workspace=%s expected_agent_prefix=%s"
+                "workspace=%s expected_agent_prefix=%s owned_by_id=%s owned_by_workspace=%s"
             ),
             user.user_id,
             requested_agent_id,
             selected_agent_id or None,
             workspace,
             user_agent_id_prefix(user.user_id),
+            owned_by_id,
+            owned_by_workspace,
         )
         raise HTTPException(status_code=404, detail=f"Agent '{requested_agent_id}' not found")
-    return selected_agent_id
+    return selected_agent_id, workspace
 
 
 async def _get_owned_agent_or_404(ws, user: AuthenticatedUser, agent_id: str) -> Dict[str, Any]:
-    resolved_agent_id = _resolve_requested_agent_id_or_400(user, agent_id)
+    candidate_ids = _candidate_agent_ids_for_request(user, agent_id)
+    resolved_agent_id = candidate_ids[0]
 
     try:
         list_payload = await ws.call("agents.list", {})
@@ -178,11 +243,16 @@ async def _get_owned_agent_or_404(ws, user: AuthenticatedUser, agent_id: str) ->
     if not isinstance(raw_agents, list):
         raw_agents = []
 
-    selected = _find_agent(raw_agents, resolved_agent_id)
+    selected = None
+    for candidate_id in candidate_ids:
+        selected = _find_agent(raw_agents, candidate_id)
+        if selected is not None:
+            break
+
     if selected is None:
         raise HTTPException(status_code=404, detail=f"Agent '{resolved_agent_id}' not found")
 
-    _enforce_agent_ownership_or_404(user, selected, requested_agent_id=resolved_agent_id)
+    await _enforce_agent_ownership_or_404(ws, user, selected, requested_agent_id=resolved_agent_id)
     return selected
 
 
@@ -213,6 +283,8 @@ async def create_agent(
         raise HTTPException(status_code=403, detail=str(e))
 
     params: Dict[str, Any] = {
+        # Use scoped agent id as OpenClaw logical id to avoid cross-user collisions
+        # when different users create same display name (e.g. "default").
         "name": scoped_agent_id,
         "workspace": workspace,
     }
@@ -237,17 +309,13 @@ async def create_agent(
         raise _map_ws_error("agents.create", e)
 
     agent_id: Optional[str] = None
-    result_name: Optional[str] = scoped_agent_id
+    result_name: Optional[str] = requested_agent_token
     result_workspace: Optional[str] = workspace
 
     if isinstance(res, dict):
         rid = res.get("agentId")
         if isinstance(rid, str) and rid.strip():
             agent_id = rid.strip().lower()
-
-        rname = res.get("name")
-        if isinstance(rname, str) and rname.strip():
-            result_name = rname.strip()
 
         rworkspace = res.get("workspace")
         if isinstance(rworkspace, str) and rworkspace.strip():
@@ -256,7 +324,9 @@ async def create_agent(
     if not agent_id:
         agent_id = scoped_agent_id
 
-    if not is_agent_id_owned_by_user(user.user_id, agent_id):
+    owned_by_id = is_agent_id_owned_by_user(user.user_id, agent_id)
+    owned_by_workspace = is_workspace_owned_by_user(user.user_id, result_workspace)
+    if not (owned_by_id or owned_by_workspace):
         rollback_error: Optional[Exception] = None
         try:
             _ = await ws.call("agents.delete", {"agentId": agent_id, "deleteFiles": True})
@@ -268,13 +338,16 @@ async def create_agent(
                 status_code=502,
                 detail=(
                     f"OpenClaw returned non-owned agent_id '{agent_id}' for user '{user.user_id}'. "
+                    f"(owned_by_id={owned_by_id}, owned_by_workspace={owned_by_workspace}) "
                     "Agent create was rolled back."
                 ),
             )
         raise HTTPException(
             status_code=502,
             detail=(
-                f"OpenClaw returned non-owned agent_id '{agent_id}' and rollback failed: {rollback_error}"
+                f"OpenClaw returned non-owned agent_id '{agent_id}' "
+                f"(owned_by_id={owned_by_id}, owned_by_workspace={owned_by_workspace}) "
+                f"and rollback failed: {rollback_error}"
             ),
         )
 
@@ -402,27 +475,38 @@ async def list_agents(
         if not isinstance(agent, dict):
             continue
 
-        workspace = _workspace_from_raw_agent(agent)
-        agent_id = str(agent.get("id") or "").strip().lower() or None
-        owned = is_agent_id_owned_by_user(user.user_id, agent_id)
-        allowed = owned
+        selected_agent_id, resolved_workspace, owned_by_id, owned_by_workspace, allowed = await _resolve_agent_ownership(
+            ws,
+            user,
+            agent,
+        )
 
         logger.info(
             (
                 "agents.list ownership check user_id=%s agent_id=%s workspace=%s "
-                "expected_agent_prefix=%s owned=%s allowed=%s"
+                "expected_agent_prefix=%s owned_by_id=%s owned_by_workspace=%s allowed=%s"
             ),
             user.user_id,
-            agent_id,
-            workspace,
+            selected_agent_id or None,
+            resolved_workspace,
             expected_agent_prefix,
-            owned,
+            owned_by_id,
+            owned_by_workspace,
             allowed,
         )
 
         if not allowed:
             continue
-        items.append(_normalize_agent_summary(agent, default_agent_id=default_agent_id))
+        items.append(
+            _normalize_agent_summary(
+                {
+                    **agent,
+                    "workspace": resolved_workspace if resolved_workspace else agent.get("workspace"),
+                },
+                default_agent_id=default_agent_id,
+                user_id=user.user_id,
+            )
+        )
 
     return AgentListResponse(
         default_agent_id=default_agent_id,
@@ -442,7 +526,8 @@ async def get_agent(
     include_files: bool = Query(default=False, description="Se true include agents.files.list"),
     user: AuthenticatedUser = Depends(get_current_user),
 ) -> AgentDetailResponse:
-    requested_agent_id = _resolve_requested_agent_id_or_400(user, agent_id)
+    candidate_ids = _candidate_agent_ids_for_request(user, agent_id)
+    requested_agent_id = candidate_ids[0]
 
     ws = await _get_connected_ws()
 
@@ -460,34 +545,51 @@ async def get_agent(
     if not isinstance(raw_agents, list):
         raw_agents = []
 
-    selected = _find_agent(raw_agents, requested_agent_id)
+    selected = None
+    for candidate_id in candidate_ids:
+        selected = _find_agent(raw_agents, candidate_id)
+        if selected is not None:
+            break
+
     if selected is None:
         raise HTTPException(status_code=404, detail=f"Agent '{requested_agent_id}' not found")
 
-    selected_workspace = _workspace_from_raw_agent(selected)
-    selected_agent_id = str(selected.get("id") or "").strip().lower()
+    selected_agent_id, selected_workspace, selected_owned_by_id, selected_owned_by_workspace, selected_allowed = (
+        await _resolve_agent_ownership(ws, user, selected)
+    )
     expected_agent_prefix = user_agent_id_prefix(user.user_id)
-    selected_owned = is_agent_id_owned_by_user(user.user_id, selected_agent_id)
-    selected_allowed = selected_owned
 
     logger.info(
         (
             "agents.get ownership check user_id=%s requested_agent_id=%s selected_agent_id=%s "
-            "workspace=%s expected_agent_prefix=%s owned=%s allowed=%s"
+            "workspace=%s expected_agent_prefix=%s owned_by_id=%s owned_by_workspace=%s allowed=%s"
         ),
         user.user_id,
         requested_agent_id,
         selected_agent_id or None,
         selected_workspace,
         expected_agent_prefix,
-        selected_owned,
+        selected_owned_by_id,
+        selected_owned_by_workspace,
         selected_allowed,
     )
 
-    _enforce_agent_ownership_or_404(user, selected, requested_agent_id=requested_agent_id)
+    _, resolved_workspace = await _enforce_agent_ownership_or_404(
+        ws,
+        user,
+        selected,
+        requested_agent_id=requested_agent_id,
+    )
 
     default_agent_id = str(list_payload.get("defaultId") or settings.openclaw_default_agent_id)
-    summary = _normalize_agent_summary(selected, default_agent_id=default_agent_id)
+    summary = _normalize_agent_summary(
+        {
+            **selected,
+            "workspace": resolved_workspace if resolved_workspace else selected.get("workspace"),
+        },
+        default_agent_id=default_agent_id,
+        user_id=user.user_id,
+    )
 
     warnings: list[str] = []
     identity: Optional[Dict[str, Any]] = None

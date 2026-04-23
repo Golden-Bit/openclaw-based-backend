@@ -13,3 +13,12 @@ minio>=7.2.7
 sse-starlette>=2.1.2
 python-multipart>=0.0.9
 orjson>=3.10.0
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+docling[rapidocr]
+
+python-docx
+openpyxl
+python-pptx
+reportlab
+Pillow
