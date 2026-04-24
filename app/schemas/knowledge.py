@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -92,3 +93,54 @@ class KnowledgeReindexResponse(BaseModel):
     mode: str
     details: dict[str, Any] | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+class KnowledgeUploadTaskAcceptedResponse(BaseModel):
+    accepted: bool
+    task_id: uuid.UUID
+    agent_id: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    status_url: str
+
+
+class KnowledgeUploadTaskItem(BaseModel):
+    task_id: uuid.UUID
+    agent_id: str
+    status: str
+    source_kind: str
+    requested_path: str
+    filename: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    expires_at: datetime
+
+
+class KnowledgeUploadTaskListResponse(BaseModel):
+    agent_id: str
+    items: list[KnowledgeUploadTaskItem] = Field(default_factory=list)
+
+
+class KnowledgeUploadTaskStatusResponse(KnowledgeUploadTaskItem):
+    result: KnowledgeFileMutationResponse | None = None
+    error_detail: Optional[str] = None
+
+
+class KnowledgeFileTaskInfoResponse(BaseModel):
+    association_status: Literal["direct", "managed_original", "ambiguous"]
+    canonical_path: str
+    active_task: KnowledgeUploadTaskItem | None = None
+    latest_successful_task: KnowledgeUploadTaskStatusResponse | None = None
+
+
+class KnowledgeFileInfoResponse(BaseModel):
+    agent_id: str
+    path: str
+    filename: str
+    size_bytes: int
+    mime_type: str
+    updated_at: datetime
+    task_info: KnowledgeFileTaskInfoResponse

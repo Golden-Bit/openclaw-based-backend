@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import base64
 import errno
-import hashlib
 import os
 import shutil
-from dataclasses import dataclass
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.endpoints import agents as agents_endpoint
 from app.core.agent_ownership import is_agent_id_owned_by_user, resolve_requested_agent_id_for_user
@@ -19,29 +19,37 @@ from app.core.config import settings
 from app.core.knowledge_conversion import (
     KnowledgeConversionDependencyError,
     KnowledgeConversionError,
-    render_markdown_for_knowledge_upload,
 )
 from app.core.knowledge_fs import (
     ALLOWED_KNOWLEDGE_EXTENSIONS,
     KnowledgePathError,
     atomic_delete_files,
-    atomic_write_files,
     detect_mime_from_name,
     ensure_root_dir,
     knowledge_root_for_workspace,
     normalize_relative_path,
     plan_knowledge_mutation,
-    plan_knowledge_write,
     reject_hardlinked_file,
     reject_symlink_chain,
     resolve_under_root,
     validate_allowed_extension,
 )
+from app.core.knowledge_upload_executor import execute_knowledge_replace, execute_knowledge_upload
+from app.core.knowledge_upload_tasks import (
+    KnowledgeUploadTaskNotFoundError,
+    build_knowledge_upload_task_accepted_response,
+    create_knowledge_upload_task,
+    get_knowledge_file_task_info,
+    get_knowledge_upload_task_status,
+    list_pending_knowledge_upload_tasks,
+)
 from app.core.security import AuthenticatedUser, get_current_user
+from app.db.session import get_db
 from app.schemas.knowledge import (
     KnowledgeFileBase64UploadRequest,
     KnowledgeFileContentResponse,
     KnowledgeFileDeleteResponse,
+    KnowledgeFileInfoResponse,
     KnowledgeFileMutationResponse,
     KnowledgeFilePutRequest,
     KnowledgeFolderCreateRequest,
@@ -51,6 +59,9 @@ from app.schemas.knowledge import (
     KnowledgeReindexResponse,
     KnowledgeTreeItem,
     KnowledgeTreeResponse,
+    KnowledgeUploadTaskAcceptedResponse,
+    KnowledgeUploadTaskListResponse,
+    KnowledgeUploadTaskStatusResponse,
 )
 
 router = APIRouter(prefix="/agents/{agent_id}/knowledge")
@@ -138,6 +149,49 @@ async def _agent_context(agent_id: str, user: AuthenticatedUser):
     root = knowledge_root_for_workspace(workspace)
     ensure_root_dir(root)
     return aid, ws, workspace, root
+
+
+def _owned_agent_id(agent_id: str, user: AuthenticatedUser) -> str:
+    try:
+        aid = resolve_requested_agent_id_for_user(user.user_id, agent_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not is_agent_id_owned_by_user(user.user_id, aid):
+        raise HTTPException(status_code=404, detail=f"Agent '{aid}' not found")
+    return aid
+
+
+async def _enqueue_knowledge_upload_task_response(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    aid: str,
+    workspace: str,
+    source_kind: str,
+    folder_path: str | None,
+    requested_path: str | None,
+    filename: str | None,
+    mime_type: str | None,
+    overwrite: bool,
+    upsert: bool,
+    data: bytes,
+) -> KnowledgeUploadTaskAcceptedResponse:
+    task = await create_knowledge_upload_task(
+        db,
+        user_id=user_id,
+        agent_id=aid,
+        workspace=workspace,
+        source_kind=source_kind,
+        folder_path=folder_path,
+        requested_path=requested_path,
+        filename=filename,
+        mime_type=mime_type,
+        overwrite=overwrite,
+        upsert=upsert,
+        data=data,
+    )
+    return build_knowledge_upload_task_accepted_response(task)
 
 
 def _resolve_folder(root: Path, path_value: str, *, allow_empty: bool) -> tuple[str, Path]:
@@ -293,32 +347,8 @@ async def delete_folder(
     return KnowledgeFolderDeleteResponse(deleted=True, agent_id=aid, path=rel)
 
 
-def _file_write_result(aid: str, rel: str, target: Path, content: bytes, mime_type: str) -> KnowledgeFileMutationResponse:
-    stat = target.stat()
-    return KnowledgeFileMutationResponse(
-        ok=True,
-        agent_id=aid,
-        path=rel,
-        filename=target.name,
-        size_bytes=stat.st_size,
-        sha256=hashlib.sha256(content).hexdigest(),
-        mime_type=mime_type,
-        updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-    )
-
-
-@dataclass(frozen=True)
-class _PreparedKnowledgeWrite:
-    response_rel: str
-    response_target: Path
-    writes: list[tuple[Path, bytes]]
-
-
 def _join_rel(folder_rel: str, filename: str) -> str:
     return f"{folder_rel}/{filename}" if folder_rel else filename
-
-
-MANAGED_MARKDOWN_WRITE_DETAIL = "Generated markdown siblings are managed by their paired original upload"
 
 
 def _folder_rel_for_file_rel(file_rel: str) -> str:
@@ -343,66 +373,6 @@ def _delete_targets_for_file(root: Path, file_rel: str, target: Path) -> list[tu
     return delete_targets
 
 
-def _prepare_knowledge_write(root: Path, folder_rel: str, filename: str, data: bytes) -> tuple[_PreparedKnowledgeWrite, Path]:
-    requested_rel = _join_rel(folder_rel, filename)
-    _requested_rel, requested_target = _resolve_file(root, requested_rel)
-
-    plan = plan_knowledge_write(requested_target.parent, requested_target.name)
-
-    response_rel = _join_rel(folder_rel, plan.original_filename)
-    response_rel, response_target = _resolve_file(root, response_rel)
-
-    writes: list[tuple[Path, bytes]] = [(response_target, data)]
-    if plan.stores_generated_markdown:
-        markdown_rel = _join_rel(folder_rel, plan.markdown_filename or "")
-        _markdown_rel, markdown_target = _resolve_file(root, markdown_rel)
-        markdown_bytes = render_markdown_for_knowledge_upload(plan.original_filename, data)
-        writes.append((markdown_target, markdown_bytes))
-
-    return _PreparedKnowledgeWrite(response_rel=response_rel, response_target=response_target, writes=writes), requested_target
-
-
-def _ensure_write_target_ok(target: Path, *, detail: str) -> None:
-    if target.exists() and target.is_dir():
-        raise HTTPException(status_code=409, detail=detail)
-    if target.exists():
-        reject_hardlinked_file(target)
-
-
-def _store_knowledge_file(
-    root: Path,
-    folder_rel: str,
-    filename: str,
-    data: bytes,
-    *,
-    allow_overwrite: bool,
-    allow_create: bool,
-    exists_detail: str,
-    missing_detail: str,
-) -> tuple[str, Path]:
-    requested_rel = _join_rel(folder_rel, filename)
-    _requested_rel, requested_target = _resolve_file(root, requested_rel)
-
-    mutation_plan = plan_knowledge_mutation(requested_target.parent, requested_target.name)
-    if mutation_plan.is_managed_markdown:
-        raise HTTPException(status_code=409, detail=MANAGED_MARKDOWN_WRITE_DETAIL)
-
-    if requested_target.exists() and requested_target.is_dir():
-        raise HTTPException(status_code=409, detail="Destination path is a folder")
-    if requested_target.exists() and not allow_overwrite:
-        raise HTTPException(status_code=409, detail=exists_detail)
-    if not requested_target.exists() and not allow_create:
-        raise HTTPException(status_code=404, detail=missing_detail)
-
-    prepared, _ = _prepare_knowledge_write(root, folder_rel, filename, data)
-    for target, _content in prepared.writes:
-        detail = "Destination path is a folder" if target == prepared.response_target else "Generated markdown path is a folder"
-        _ensure_write_target_ok(target, detail=detail)
-
-    atomic_write_files(prepared.writes)
-    return prepared.response_rel, prepared.response_target
-
-
 @router.post("/files/upload", response_model=KnowledgeFileMutationResponse, summary="Upload multipart file in knowledge")
 async def upload_file(
     agent_id: str,
@@ -421,19 +391,16 @@ async def upload_file(
         data = await file.read()
         _ensure_size_ok(len(data))
 
-        rel, target = _store_knowledge_file(
+        mime_type = (file.content_type or "").strip() or detect_mime_from_name(final_name)
+        return execute_knowledge_upload(
+            aid,
             root,
-            folder_rel,
-            final_name,
-            data,
-            allow_overwrite=overwrite,
-            allow_create=True,
-            exists_detail="File already exists; set overwrite=true",
-            missing_detail="",
+            folder_rel=folder_rel,
+            filename=final_name,
+            data=data,
+            overwrite=overwrite,
+            mime_type=mime_type,
         )
-
-        mime_type = (file.content_type or "").strip() or detect_mime_from_name(target.name)
-        return _file_write_result(aid, rel, target, data, mime_type)
     except HTTPException:
         raise
     except KnowledgeConversionDependencyError as e:
@@ -459,19 +426,16 @@ async def upload_file_base64(
         data = base64.b64decode(body.content_base64, validate=True)
         _ensure_size_ok(len(data))
 
-        rel, target = _store_knowledge_file(
+        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(final_name)
+        return execute_knowledge_upload(
+            aid,
             root,
-            folder_rel,
-            final_name,
-            data,
-            allow_overwrite=body.overwrite,
-            allow_create=True,
-            exists_detail="File already exists; set overwrite=true",
-            missing_detail="",
+            folder_rel=folder_rel,
+            filename=final_name,
+            data=data,
+            overwrite=body.overwrite,
+            mime_type=mime_type,
         )
-
-        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(target.name)
-        return _file_write_result(aid, rel, target, data, mime_type)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
     except HTTPException:
@@ -498,21 +462,15 @@ async def replace_file(
         data = base64.b64decode(body.content_base64, validate=True)
         _ensure_size_ok(len(data))
 
-        folder_rel = _folder_rel_for_file_rel(rel)
-
-        rel, target = _store_knowledge_file(
-            root,
-            folder_rel,
-            target.name,
-            data,
-            allow_overwrite=True,
-            allow_create=body.upsert,
-            exists_detail="",
-            missing_detail="File not found; set upsert=true to create it",
-        )
-
         mime_type = (body.mime_type or "").strip() or detect_mime_from_name(target.name)
-        return _file_write_result(aid, rel, target, data, mime_type)
+        return execute_knowledge_replace(
+            aid,
+            root,
+            file_rel=rel,
+            data=data,
+            upsert=body.upsert,
+            mime_type=mime_type,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
     except HTTPException:
@@ -523,6 +481,170 @@ async def replace_file(
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:  # noqa: BLE001
         raise _map_path_error(e)
+
+
+@router.post(
+    "/files/upload/background",
+    response_model=KnowledgeUploadTaskAcceptedResponse,
+    status_code=202,
+    summary="Enqueue multipart knowledge upload",
+)
+async def upload_file_background(
+    agent_id: str,
+    file: UploadFile = File(...),
+    path: str = Form(default="", description="Path relativa cartella destinazione"),
+    filename: str | None = Form(default=None, description="Filename opzionale override"),
+    overwrite: bool = Form(default=False),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeUploadTaskAcceptedResponse:
+    aid, _ws, workspace, _root = await _agent_context(agent_id, user)
+    try:
+        folder_rel = normalize_relative_path(path, allow_empty=True)
+        final_name = _sanitize_filename(filename or file.filename or "")
+        validate_allowed_extension(final_name, ALLOWED_KNOWLEDGE_EXTENSIONS)
+
+        data = await file.read()
+        _ensure_size_ok(len(data))
+
+        mime_type = (file.content_type or "").strip() or detect_mime_from_name(final_name)
+        return await _enqueue_knowledge_upload_task_response(
+            db,
+            user_id=user.user_id,
+            aid=aid,
+            workspace=workspace,
+            source_kind="multipart",
+            folder_path=folder_rel,
+            requested_path=None,
+            filename=final_name,
+            mime_type=mime_type,
+            overwrite=overwrite,
+            upsert=False,
+            data=data,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _map_path_error(e)
+
+
+@router.post(
+    "/files/base64/background",
+    response_model=KnowledgeUploadTaskAcceptedResponse,
+    status_code=202,
+    summary="Enqueue base64 knowledge upload",
+)
+async def upload_file_base64_background(
+    agent_id: str,
+    body: KnowledgeFileBase64UploadRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeUploadTaskAcceptedResponse:
+    aid, _ws, workspace, _root = await _agent_context(agent_id, user)
+    try:
+        folder_rel = normalize_relative_path(body.path, allow_empty=True)
+        final_name = _sanitize_filename(body.filename)
+        validate_allowed_extension(final_name, ALLOWED_KNOWLEDGE_EXTENSIONS)
+
+        data = base64.b64decode(body.content_base64, validate=True)
+        _ensure_size_ok(len(data))
+
+        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(final_name)
+        return await _enqueue_knowledge_upload_task_response(
+            db,
+            user_id=user.user_id,
+            aid=aid,
+            workspace=workspace,
+            source_kind="base64",
+            folder_path=folder_rel,
+            requested_path=None,
+            filename=final_name,
+            mime_type=mime_type,
+            overwrite=body.overwrite,
+            upsert=False,
+            data=data,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _map_path_error(e)
+
+
+@router.put(
+    "/files/background",
+    response_model=KnowledgeUploadTaskAcceptedResponse,
+    status_code=202,
+    summary="Enqueue replace file content in knowledge",
+)
+async def replace_file_background(
+    agent_id: str,
+    body: KnowledgeFilePutRequest,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeUploadTaskAcceptedResponse:
+    aid, _ws, workspace, root = await _agent_context(agent_id, user)
+    try:
+        rel, target = _resolve_file(root, body.path)
+        validate_allowed_extension(target.name, ALLOWED_KNOWLEDGE_EXTENSIONS)
+
+        data = base64.b64decode(body.content_base64, validate=True)
+        _ensure_size_ok(len(data))
+
+        mime_type = (body.mime_type or "").strip() or detect_mime_from_name(target.name)
+        return await _enqueue_knowledge_upload_task_response(
+            db,
+            user_id=user.user_id,
+            aid=aid,
+            workspace=workspace,
+            source_kind="replace",
+            folder_path=None,
+            requested_path=rel,
+            filename=target.name,
+            mime_type=mime_type,
+            overwrite=True,
+            upsert=body.upsert,
+            data=data,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _map_path_error(e)
+
+
+@router.get(
+    "/tasks/pending",
+    response_model=KnowledgeUploadTaskListResponse,
+    summary="List pending background knowledge upload tasks",
+)
+async def list_pending_background_tasks(
+    agent_id: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeUploadTaskListResponse:
+    aid = _owned_agent_id(agent_id, user)
+    return await list_pending_knowledge_upload_tasks(db, user_id=user.user_id, agent_id=aid)
+
+
+@router.get(
+    "/tasks/{task_id}",
+    response_model=KnowledgeUploadTaskStatusResponse,
+    summary="Get background knowledge upload task status",
+)
+async def get_background_task_status(
+    agent_id: str,
+    task_id: uuid.UUID,
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeUploadTaskStatusResponse:
+    aid = _owned_agent_id(agent_id, user)
+    try:
+        return await get_knowledge_upload_task_status(db, user_id=user.user_id, agent_id=aid, task_id=task_id)
+    except KnowledgeUploadTaskNotFoundError:
+        raise HTTPException(status_code=404, detail="Knowledge upload task not found") from None
 
 
 @router.delete("/files", response_model=KnowledgeFileDeleteResponse, summary="Delete file in knowledge")
@@ -554,6 +676,45 @@ async def delete_file(
         raise _map_path_error(e)
 
     return KnowledgeFileDeleteResponse(deleted=True, agent_id=aid, path=rel)
+
+
+@router.get("/files/info", response_model=KnowledgeFileInfoResponse, summary="Read file metadata from knowledge")
+async def get_file_info(
+    agent_id: str,
+    path: str = Query(..., description="Path relativa file"),
+    user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KnowledgeFileInfoResponse:
+    aid, _ws, _workspace, root = await _agent_context(agent_id, user)
+    try:
+        rel, target = _resolve_file(root, path)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError(str(target))
+        reject_hardlinked_file(target)
+
+        stat = target.stat()
+        task_info = await get_knowledge_file_task_info(
+            db,
+            user_id=user.user_id,
+            agent_id=aid,
+            file_rel=rel,
+            target=target,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise _map_path_error(e)
+
+    mime_type = detect_mime_from_name(target.name)
+    return KnowledgeFileInfoResponse(
+        agent_id=aid,
+        path=rel,
+        filename=target.name,
+        size_bytes=stat.st_size,
+        mime_type=mime_type,
+        updated_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+        task_info=task_info,
+    )
 
 
 @router.get("/files/content", response_model=KnowledgeFileContentResponse, summary="Read file content from knowledge")

@@ -14,7 +14,7 @@ Il backend comunica con OpenClaw via:
 ## Componenti
 
 - **FastAPI app** (`app/main.py`)
-- **PostgreSQL** (conversations, messages, uploads, conversation_aliases)
+- **PostgreSQL** (conversations, messages, uploads, conversation_aliases, knowledge_upload_tasks)
 - **MinIO** (file object storage)
 - **Keycloak** opzionale (JWT + JWKS)
 - **OpenClaw Gateway** esterno (host locale o remoto)
@@ -37,10 +37,12 @@ In startup (`lifespan`):
 2. Esegue `init_db(engine)` (`create_all`)
 3. Inizializza MinIO e garantisce bucket
 4. Non forza connect WS (client lazy)
+5. Recupera e riesegue best-effort i knowledge upload background task non terminali ancora validi
 
 In shutdown:
-1. Chiusura WS client (best-effort)
-2. `engine.dispose()`
+1. Attende la fine dei knowledge upload background task locali ancora in esecuzione
+2. Chiusura WS client (best-effort)
+3. `engine.dispose()`
 
 ## Modello dati
 
@@ -59,6 +61,11 @@ In shutdown:
 ### Upload
 - metadati file (`bucket`, `object_key`, `filename`, `mime_type`, `size_bytes`, `sha256`)
 - `metadata_` (colonna DB `metadata`), `tags`, `status`, soft delete
+
+### KnowledgeUploadTask
+- task background per upload knowledge (`pending|running|succeeded|failed|expired`)
+- snapshot workspace/agent, payload staged su filesystem locale workspace, result/error payload persistiti su DB
+- cleanup logico dei task pending scaduti oltre 30 minuti
 
 ### ConversationAlias
 - presente a livello DB ma non usata nel routing dei path attivi `/api/v1/*`
@@ -107,6 +114,10 @@ In shutdown:
 - Root fisica gestita dal BFF: `<workspace>/memory/knowledge`
 - Endpoint CRUD cartelle/file: `/api/v1/agents/{agent_id}/knowledge/*`
 - Upload supportati: multipart e base64
+- Endpoint background aggiuntivi: `POST /files/upload/background`, `POST /files/base64/background`, `PUT /files/background`, `GET /tasks/pending`, `GET /tasks/{task_id}`
+- Endpoint metadata file: `GET /files/info`, che restituisce info file path-based e task info associata (`active_task`, `latest_successful_task`); per markdown gestiti espone `association_status=managed_original` e `canonical_path` verso il file originale pairato
+- I task background persistono metadati su DB, staging bytes su `<workspace>/memory/.knowledge-upload-tasks/<task_id>/`, e riusano la stessa logica sync di write/mutation
+- I task pending oltre 30 minuti vengono marcati `expired` e non compaiono più nella pending list; questa normalizzazione avviene anche quando `/files/info` risolve la task info associata
 - Sicurezza path:
   - solo path relative
   - blocco `..`, path assoluti e home-relative

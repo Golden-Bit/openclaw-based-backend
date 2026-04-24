@@ -29,6 +29,9 @@ def test_ensure_share_skill_creates_file(monkeypatch: MonkeyPatch, tmp_path: Pat
     assert "name: share-files" in content
     assert f"User namespace (hash-only): `{ns}`" in content
     assert "https://api.example.com/shared/files" in content
+    assert "Use this shared hosting procedure as the only way to provide downloadable files to the user." in content
+    assert "Never send workspace paths, local filesystem paths, `memory/...` paths, or any other internal OpenClaw/backend-only path" in content
+    assert "If a file is generated somewhere else in the workspace, first copy or export it under" in content
     assert "Default shared links download directly." in content
     assert "?inline=true" in content
 

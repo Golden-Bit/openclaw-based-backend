@@ -10,6 +10,7 @@ from app.api.shared_files import router as shared_files_router
 from app.core.config import settings
 from app.core.minio_client import ensure_bucket, get_minio_client
 from app.core.openclaw_ws import OpenClawWSClient
+from app.core.knowledge_upload_tasks import recover_knowledge_upload_tasks, shutdown_knowledge_upload_tasks
 from app.core.shared_files import ensure_shared_files_root
 from app.db.init_db import init_db
 from app.db.session import engine
@@ -58,9 +59,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         logger.warning("Shared files root init failed (continuing): %s", e)
 
+    try:
+        await recover_knowledge_upload_tasks()
+        logger.info("Knowledge upload background tasks recovered")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Knowledge upload task recovery failed (continuing): %s", e)
+
     yield
 
     # Shutdown
+    try:
+        await shutdown_knowledge_upload_tasks()
+    except Exception:
+        pass
+
     try:
         ws = get_ws_client()
         await ws.close()

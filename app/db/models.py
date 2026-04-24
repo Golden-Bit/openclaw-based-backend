@@ -97,6 +97,51 @@ class Upload(Base):
     )
 
 
+class KnowledgeUploadTask(Base):
+    """Background knowledge-upload task persisted in Postgres."""
+
+    __tablename__ = "knowledge_upload_tasks"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(String(200), index=True)
+    agent_id: Mapped[str] = mapped_column(String(200), index=True)
+
+    workspace: Mapped[str] = mapped_column(String(1000))
+    source_kind: Mapped[str] = mapped_column(String(50))
+
+    folder_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    requested_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    filename: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    mime_type: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    overwrite: Mapped[bool] = mapped_column(Boolean, default=False)
+    upsert: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    stage_dir: Mapped[str] = mapped_column(String(1200))
+    staged_size_bytes: Mapped[int] = mapped_column(nullable=False)
+    staged_sha256: Mapped[str] = mapped_column(String(64))
+
+    status: Mapped[str] = mapped_column(String(50), default="pending", index=True)
+    result_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    __table_args__ = (
+        Index("ix_knowledge_upload_tasks_user_agent_status", "user_id", "agent_id", "status"),
+        Index("ix_knowledge_upload_tasks_status_updated_at", "status", "updated_at"),
+    )
+
+
 class ConversationAlias(Base):
     """Mapping per compatibilità OpenAI/OpenResponses."""
 

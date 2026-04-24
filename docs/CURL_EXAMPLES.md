@@ -154,6 +154,63 @@ curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/base64
   -d '{"path":"project-a/docs","filename":"brief.pdf","content_base64":"JVBERi0xLjQK","overwrite":true}' | jq
 ```
 
+## Upload knowledge file in background (multipart)
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/upload/background" \
+  -H 'X-Debug-User: dev-user' \
+  -F "path=project-a/docs" \
+  -F "overwrite=true" \
+  -F "file=@./README.md" | jq
+```
+
+## Upload knowledge file in background (base64)
+
+```bash
+curl -s -X POST "http://localhost:8000/api/v1/agents/main/knowledge/files/base64/background" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs","filename":"brief.pdf","content_base64":"JVBERi0xLjQK","overwrite":true}' | jq
+```
+
+## Replace knowledge file in background
+
+```bash
+curl -s -X PUT "http://localhost:8000/api/v1/agents/main/knowledge/files/background" \
+  -H 'Content-Type: application/json' \
+  -H 'X-Debug-User: dev-user' \
+  -d '{"path":"project-a/docs/brief.pdf","content_base64":"JVBERi0xLjQK","upsert":true}' | jq
+```
+
+## List pending background knowledge tasks
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main/knowledge/tasks/pending" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Get background knowledge task status
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main/knowledge/tasks/<task_id>" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
+## Read knowledge file metadata with associated task info
+
+The response keeps file metadata path-based and adds `task_info` with:
+- `association_status`: `direct`, `managed_original`, or `ambiguous`
+- `canonical_path`: the task path used for association
+- `active_task`: newest matching `pending`/`running` task, when present
+- `latest_successful_task`: newest matching succeeded task, matched by final stored `result.path`
+
+If you ask for a managed markdown file such as `project-a/docs/brief.md`, the file metadata still refers to `brief.md`, while `task_info.canonical_path` points to the paired original file path `project-a/docs/brief.pdf`.
+
+```bash
+curl -s "http://localhost:8000/api/v1/agents/main/knowledge/files/info?path=project-a/docs/brief.pdf" \
+  -H 'X-Debug-User: dev-user' | jq
+```
+
 ## Read knowledge file content
 
 ```bash

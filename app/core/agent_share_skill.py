@@ -44,11 +44,14 @@ Use this skill when you need to create files that the user can download via brow
 
 ## Mandatory rules
 
-1. Write files only under `{user_share_root}/`
-2. Never write outside that directory.
-3. Build default public links as: `{public_base}/<relative_path_from_shared_root>`
-4. Default shared links download directly. Use `?inline=true` only when the user explicitly asks for browser preview.
-5. Always reply with a markdown download link unless the user asked for inline preview.
+1. Use this shared hosting procedure as the only way to provide downloadable files to the user.
+2. Write files only under `{user_share_root}/`
+3. Never write outside that directory.
+4. Never send workspace paths, local filesystem paths, `memory/...` paths, or any other internal OpenClaw/backend-only path as if the user could download them remotely.
+5. If a file is generated somewhere else in the workspace, first copy or export it under `{user_share_root}/`, then share the public link.
+6. Build default public links as: `{public_base}/<relative_path_from_shared_root>`
+7. Default shared links download directly. Use `?inline=true` only when the user explicitly asks for browser preview.
+8. Always reply with a markdown download link unless the user asked for inline preview.
 
 ## Example
 

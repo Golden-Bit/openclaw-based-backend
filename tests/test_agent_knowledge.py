@@ -2,6 +2,8 @@ import asyncio
 import base64
 import io
 import sys
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +22,13 @@ from app.core.security import AuthenticatedUser
 from app.schemas.knowledge import (
     KnowledgeFileBase64UploadRequest,
     KnowledgeFilePutRequest,
+    KnowledgeFileTaskInfoResponse,
     KnowledgeFolderCreateRequest,
     KnowledgeFolderMoveRequest,
+    KnowledgeUploadTaskAcceptedResponse,
+    KnowledgeUploadTaskItem,
+    KnowledgeUploadTaskListResponse,
+    KnowledgeUploadTaskStatusResponse,
 )
 
 
@@ -153,6 +160,174 @@ def test_upload_base64_rejects_invalid_filename(monkeypatch: MonkeyPatch, tmp_pa
         )
 
     assert exc_info.value.status_code == 400
+
+
+def test_get_file_info_returns_task_metadata(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    target = folder / "brief.pdf"
+    target.write_bytes(b"%PDF-1.7 fake")
+
+    active_task_id = uuid.uuid4()
+    success_task_id = uuid.uuid4()
+
+    async def _get_task_info(db, *, user_id: str, agent_id: str, file_rel: str, target: Path):
+        assert isinstance(db, _FakeDB)
+        assert user_id == "u1"
+        assert agent_id == "main"
+        assert file_rel == "research/brief.pdf"
+        assert target.name == "brief.pdf"
+        return KnowledgeFileTaskInfoResponse(
+            association_status="direct",
+            canonical_path="research/brief.pdf",
+            active_task=KnowledgeUploadTaskItem(
+                task_id=active_task_id,
+                agent_id=agent_id,
+                status="running",
+                source_kind="multipart",
+                requested_path="research/brief.pdf",
+                filename="brief.pdf",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                started_at=datetime.utcnow(),
+                finished_at=None,
+                expires_at=datetime.utcnow() + timedelta(minutes=30),
+            ),
+            latest_successful_task=KnowledgeUploadTaskStatusResponse(
+                task_id=success_task_id,
+                agent_id=agent_id,
+                status="succeeded",
+                source_kind="base64",
+                requested_path="research/brief.pdf",
+                filename="brief.pdf",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                started_at=datetime.utcnow(),
+                finished_at=datetime.utcnow(),
+                expires_at=datetime.utcnow() + timedelta(minutes=30),
+                result=knowledge_endpoint.KnowledgeFileMutationResponse(
+                    ok=True,
+                    agent_id=agent_id,
+                    path="research/brief.pdf",
+                    filename="brief.pdf",
+                    size_bytes=len(b"%PDF-1.7 fake"),
+                    sha256="abc",
+                    mime_type="application/pdf",
+                    updated_at=datetime.utcnow(),
+                ),
+                error_detail=None,
+            ),
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, 'get_knowledge_file_task_info', _get_task_info)
+
+    info = asyncio.run(
+        knowledge_endpoint.get_file_info(
+            'main',
+            path='research/brief.pdf',
+            user=_user('u1'),
+            db=_FakeDB(),
+        )
+    )
+
+    assert info.agent_id == 'main'
+    assert info.path == 'research/brief.pdf'
+    assert info.filename == 'brief.pdf'
+    assert info.size_bytes == len(b"%PDF-1.7 fake")
+    assert info.task_info.association_status == 'direct'
+    assert info.task_info.canonical_path == 'research/brief.pdf'
+    assert info.task_info.active_task is not None
+    assert info.task_info.active_task.task_id == active_task_id
+    assert info.task_info.latest_successful_task is not None
+    assert info.task_info.latest_successful_task.task_id == success_task_id
+    assert info.task_info.latest_successful_task.result is not None
+    assert info.task_info.latest_successful_task.result.path == 'research/brief.pdf'
+
+
+def test_get_file_info_for_managed_markdown_returns_canonical_task_info(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / "research"
+    folder.mkdir(parents=True)
+    (folder / "brief.pdf").write_bytes(b"%PDF-1.7 fake")
+    target = folder / "brief.md"
+    target.write_text("# Generated\n", encoding="utf-8")
+
+    success_task_id = uuid.uuid4()
+
+    async def _get_task_info(db, *, user_id: str, agent_id: str, file_rel: str, target: Path):
+        assert isinstance(db, _FakeDB)
+        assert user_id == "u1"
+        assert agent_id == "main"
+        assert file_rel == "research/brief.md"
+        assert target.name == "brief.md"
+        return KnowledgeFileTaskInfoResponse(
+            association_status="managed_original",
+            canonical_path="research/brief.pdf",
+            active_task=None,
+            latest_successful_task=KnowledgeUploadTaskStatusResponse(
+                task_id=success_task_id,
+                agent_id=agent_id,
+                status="succeeded",
+                source_kind="base64",
+                requested_path="research/brief.pdf",
+                filename="brief.pdf",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                started_at=datetime.utcnow(),
+                finished_at=datetime.utcnow(),
+                expires_at=datetime.utcnow() + timedelta(minutes=30),
+                result=knowledge_endpoint.KnowledgeFileMutationResponse(
+                    ok=True,
+                    agent_id=agent_id,
+                    path="research/brief.pdf",
+                    filename="brief.pdf",
+                    size_bytes=len(b"%PDF-1.7 fake"),
+                    sha256="def",
+                    mime_type="application/pdf",
+                    updated_at=datetime.utcnow(),
+                ),
+                error_detail=None,
+            ),
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, 'get_knowledge_file_task_info', _get_task_info)
+
+    info = asyncio.run(
+        knowledge_endpoint.get_file_info(
+            'main',
+            path='research/brief.md',
+            user=_user('u1'),
+            db=_FakeDB(),
+        )
+    )
+
+    assert info.path == 'research/brief.md'
+    assert info.filename == 'brief.md'
+    assert info.mime_type == 'text/markdown'
+    assert info.task_info.association_status == 'managed_original'
+    assert info.task_info.canonical_path == 'research/brief.pdf'
+    assert info.task_info.active_task is None
+    assert info.task_info.latest_successful_task is not None
+    assert info.task_info.latest_successful_task.task_id == success_task_id
+    assert info.task_info.latest_successful_task.result is not None
+    assert info.task_info.latest_successful_task.result.path == 'research/brief.pdf'
+
+
+def test_get_file_info_returns_404_for_missing_path(monkeypatch: MonkeyPatch, tmp_path: Path):
+    _patch_context(monkeypatch, tmp_path)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            knowledge_endpoint.get_file_info(
+                'main',
+                path='research/missing.md',
+                user=_user('u1'),
+                db=_FakeDB(),
+            )
+        )
+
+    assert exc_info.value.status_code == 404
 
 
 def test_replace_file_requires_upsert_when_missing(monkeypatch: MonkeyPatch, tmp_path: Path):
@@ -763,3 +938,223 @@ def test_delete_standalone_markdown_removes_only_that_file(monkeypatch: MonkeyPa
     assert not (folder / 'note.md').exists()
     assert (folder / 'brief.pdf').read_bytes() == b'old-pdf'
     assert (folder / 'brief.md').read_text(encoding='utf-8') == 'managed'
+
+
+class _FakeDB:
+    pass
+
+
+def test_upload_multipart_background_returns_task_id(monkeypatch: MonkeyPatch, tmp_path: Path):
+    _patch_context(monkeypatch, tmp_path)
+    task_id = uuid.uuid4()
+
+    async def _enqueue(db, **kwargs):
+        assert isinstance(db, _FakeDB)
+        assert kwargs['source_kind'] == 'multipart'
+        assert kwargs['folder_path'] == 'research'
+        assert kwargs['filename'] == 'brief.pdf'
+        assert kwargs['overwrite'] is True
+        assert kwargs['upsert'] is False
+        assert kwargs['data'] == b'%PDF-background'
+        return KnowledgeUploadTaskAcceptedResponse(
+            accepted=True,
+            task_id=task_id,
+            agent_id=kwargs['aid'],
+            status='pending',
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+            status_url=f"/api/v1/agents/{kwargs['aid']}/knowledge/tasks/{task_id}",
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, '_enqueue_knowledge_upload_task_response', _enqueue)
+
+    upload = UploadFile(filename='brief.pdf', file=io.BytesIO(b'%PDF-background'))
+    accepted = asyncio.run(
+        knowledge_endpoint.upload_file_background(
+            'main',
+            file=upload,
+            path='research',
+            filename=None,
+            overwrite=True,
+            user=_user('u1'),
+            db=_FakeDB(),
+        )
+    )
+
+    assert accepted.accepted is True
+    assert accepted.task_id == task_id
+    assert accepted.status == 'pending'
+
+
+def test_upload_base64_background_returns_task_id(monkeypatch: MonkeyPatch, tmp_path: Path):
+    _patch_context(monkeypatch, tmp_path)
+    task_id = uuid.uuid4()
+
+    async def _enqueue(db, **kwargs):
+        assert isinstance(db, _FakeDB)
+        assert kwargs['source_kind'] == 'base64'
+        assert kwargs['filename'] == 'brief.pdf'
+        assert kwargs['overwrite'] is False
+        assert kwargs['data'] == b'%PDF-base64'
+        return KnowledgeUploadTaskAcceptedResponse(
+            accepted=True,
+            task_id=task_id,
+            agent_id=kwargs['aid'],
+            status='pending',
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+            status_url=f"/api/v1/agents/{kwargs['aid']}/knowledge/tasks/{task_id}",
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, '_enqueue_knowledge_upload_task_response', _enqueue)
+
+    accepted = asyncio.run(
+        knowledge_endpoint.upload_file_base64_background(
+            'main',
+            KnowledgeFileBase64UploadRequest(
+                path='research',
+                filename='brief.pdf',
+                content_base64=_b64(b'%PDF-base64'),
+                overwrite=False,
+            ),
+            _user('u1'),
+            _FakeDB(),
+        )
+    )
+
+    assert accepted.accepted is True
+    assert accepted.task_id == task_id
+
+
+def test_replace_background_returns_task_id(monkeypatch: MonkeyPatch, tmp_path: Path):
+    root, _ = _patch_context(monkeypatch, tmp_path)
+    folder = root / 'research'
+    folder.mkdir(parents=True)
+    (folder / 'brief.pdf').write_bytes(b'old-pdf')
+    task_id = uuid.uuid4()
+
+    async def _enqueue(db, **kwargs):
+        assert isinstance(db, _FakeDB)
+        assert kwargs['source_kind'] == 'replace'
+        assert kwargs['requested_path'] == 'research/brief.pdf'
+        assert kwargs['filename'] == 'brief.pdf'
+        assert kwargs['upsert'] is False
+        assert kwargs['data'] == b'new-pdf'
+        return KnowledgeUploadTaskAcceptedResponse(
+            accepted=True,
+            task_id=task_id,
+            agent_id=kwargs['aid'],
+            status='pending',
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+            status_url=f"/api/v1/agents/{kwargs['aid']}/knowledge/tasks/{task_id}",
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, '_enqueue_knowledge_upload_task_response', _enqueue)
+
+    accepted = asyncio.run(
+        knowledge_endpoint.replace_file_background(
+            'main',
+            KnowledgeFilePutRequest(
+                path='research/brief.pdf',
+                content_base64=_b64(b'new-pdf'),
+                upsert=False,
+            ),
+            _user('u1'),
+            _FakeDB(),
+        )
+    )
+
+    assert accepted.accepted is True
+    assert accepted.task_id == task_id
+
+
+def test_list_pending_background_tasks_returns_pending_items(monkeypatch: MonkeyPatch):
+    task_id = uuid.uuid4()
+
+    async def _list_pending(db, *, user_id: str, agent_id: str):
+        assert isinstance(db, _FakeDB)
+        assert user_id == 'u1'
+        assert agent_id == 'u1-main'
+        return KnowledgeUploadTaskListResponse(
+            agent_id=agent_id,
+            items=[
+                KnowledgeUploadTaskItem(
+                    task_id=task_id,
+                    agent_id=agent_id,
+                    status='pending',
+                    source_kind='multipart',
+                    requested_path='research/brief.pdf',
+                    filename='brief.pdf',
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                    started_at=None,
+                    finished_at=None,
+                    expires_at=datetime.utcnow() + timedelta(minutes=30),
+                )
+            ],
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, 'list_pending_knowledge_upload_tasks', _list_pending)
+
+    listed = asyncio.run(knowledge_endpoint.list_pending_background_tasks('main', _user('u1'), _FakeDB()))
+
+    assert listed.agent_id == 'u1-main'
+    assert len(listed.items) == 1
+    assert listed.items[0].task_id == task_id
+
+
+def test_get_background_task_status_returns_task_payload(monkeypatch: MonkeyPatch):
+    task_id = uuid.uuid4()
+
+    async def _get_status(db, *, user_id: str, agent_id: str, task_id: uuid.UUID):
+        assert isinstance(db, _FakeDB)
+        assert user_id == 'u1'
+        assert agent_id == 'u1-main'
+        return KnowledgeUploadTaskStatusResponse(
+            task_id=task_id,
+            agent_id=agent_id,
+            status='succeeded',
+            source_kind='base64',
+            requested_path='research/brief.pdf',
+            filename='brief.pdf',
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+            started_at=datetime.utcnow(),
+            finished_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(minutes=30),
+            result=knowledge_endpoint.KnowledgeFileMutationResponse(
+                ok=True,
+                agent_id=agent_id,
+                path='research/brief.pdf',
+                filename='brief.pdf',
+                size_bytes=8,
+                sha256='abc',
+                mime_type='application/pdf',
+                updated_at=datetime.utcnow(),
+            ),
+            error_detail=None,
+        )
+
+    monkeypatch.setattr(knowledge_endpoint, 'get_knowledge_upload_task_status', _get_status)
+
+    status = asyncio.run(knowledge_endpoint.get_background_task_status('main', task_id, _user('u1'), _FakeDB()))
+
+    assert status.task_id == task_id
+    assert status.status == 'succeeded'
+    assert status.result is not None
+    assert status.result.path == 'research/brief.pdf'
+
+
+def test_get_background_task_status_returns_404_for_unknown_task(monkeypatch: MonkeyPatch):
+    task_id = uuid.uuid4()
+
+    async def _get_status(db, *, user_id: str, agent_id: str, task_id: uuid.UUID):
+        raise knowledge_endpoint.KnowledgeUploadTaskNotFoundError(str(task_id))
+
+    monkeypatch.setattr(knowledge_endpoint, 'get_knowledge_upload_task_status', _get_status)
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(knowledge_endpoint.get_background_task_status('main', task_id, _user('u1'), _FakeDB()))
+
+    assert exc_info.value.status_code == 404

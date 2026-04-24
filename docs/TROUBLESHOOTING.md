@@ -197,3 +197,16 @@
 - verifica permessi write sul workspace agente
 - verifica `SHARED_FILES_ROOT`, `SHARED_FILES_URL_PREFIX`, `BFF_PUBLIC_BASE_URL`
 - se necessario crea manualmente `skills/share-files/`, `skills/file-reference-disambiguation/`, `skills/response-language/` e `skills/document-creation-and-manipulation/` nel workspace e riprova
+
+
+## Task knowledge upload rimasto pending troppo a lungo
+
+### Causa
+- il task background knowledge è rimasto `pending` oltre il timeout hardcoded di 30 minuti
+- il backend lo marca `expired` durante startup o durante lettura di pending list / status task
+
+### Verifica/Fix
+- controlla `GET /api/v1/agents/{agent_id}/knowledge/tasks/{task_id}`
+- se stai già interrogando `GET /api/v1/agents/{agent_id}/knowledge/files/info?path=...`, ricorda che quel lookup normalizza anche task stale `pending/running` in `expired` prima di restituire `task_info`
+- se il task è `expired`, ripeti l’upload background o usa il corrispondente endpoint sync
+- se il problema è frequente, verifica carico del processo e tempi di conversione Docling

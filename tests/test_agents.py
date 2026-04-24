@@ -41,7 +41,7 @@ def _patch_ws(monkeypatch: MonkeyPatch, ws: _FakeWS):
     monkeypatch.setattr(agents_endpoint, "_get_connected_ws", _get_connected_ws)
 
 
-def _patch_skill_bootstraps(monkeypatch: MonkeyPatch, *, fail_skill: str | None = None):
+def _patch_workspace_bootstraps(monkeypatch: MonkeyPatch, *, fail_skill: str | None = None):
     calls: list[tuple[str, str, str]] = []
 
     def _ensure_share_skill_for_agent(workspace: str, *, user_id: str):
@@ -68,6 +68,12 @@ def _patch_skill_bootstraps(monkeypatch: MonkeyPatch, *, fail_skill: str | None 
             raise RuntimeError("bootstrap failed")
         return Path(workspace) / "skills" / "document-creation-and-manipulation" / "SKILL.md"
 
+    def _ensure_agents_md_for_agent(workspace: str, *, user_id: str):
+        calls.append(("agents-md", workspace, user_id))
+        if fail_skill == "agents-md":
+            raise RuntimeError("bootstrap failed")
+        return Path(workspace) / "AGENTS.md"
+
     monkeypatch.setattr(agents_endpoint, "ensure_share_skill_for_agent", _ensure_share_skill_for_agent)
     monkeypatch.setattr(
         agents_endpoint,
@@ -83,6 +89,11 @@ def _patch_skill_bootstraps(monkeypatch: MonkeyPatch, *, fail_skill: str | None 
         agents_endpoint,
         "ensure_document_skill_for_agent",
         _ensure_document_skill_for_agent,
+    )
+    monkeypatch.setattr(
+        agents_endpoint,
+        "ensure_agents_md_for_agent",
+        _ensure_agents_md_for_agent,
     )
     return calls
 
@@ -187,7 +198,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
         }
     )
     _patch_ws(monkeypatch, ws)
-    skill_calls = _patch_skill_bootstraps(monkeypatch)
+    skill_calls = _patch_workspace_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -215,6 +226,7 @@ def test_create_agent_success(monkeypatch: MonkeyPatch):
         ("file-reference-disambiguation", "/tmp/a1", "u1"),
         ("response-language", "/tmp/a1", "u1"),
         ("document-creation-and-manipulation", "/tmp/a1", "u1"),
+        ("agents-md", "/tmp/a1", "u1"),
     ]
 
 
@@ -223,7 +235,7 @@ def test_create_agent_uses_user_scoped_id_even_with_long_input(monkeypatch: Monk
     scoped = build_user_scoped_agent_id("u1", long_name)
     ws = _FakeWS(responses={"agents.create": {"ok": True, "agentId": scoped, "workspace": normalize_workspace_for_user("u1", "a1")}})
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstraps(monkeypatch)
+    _ = _patch_workspace_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -249,7 +261,7 @@ def test_create_agent_falls_back_to_requested_plain_name_when_gateway_omits_name
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstraps(monkeypatch)
+    _ = _patch_workspace_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -285,7 +297,7 @@ def test_create_agent_returns_requested_plain_name_even_when_gateway_echoes_scop
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstraps(monkeypatch)
+    _ = _patch_workspace_bootstraps(monkeypatch)
 
     res = asyncio.run(
         agents_endpoint.create_agent(
@@ -307,7 +319,7 @@ def test_create_agent_rolls_back_when_returned_agent_id_is_not_owned(monkeypatch
         }
     )
     _patch_ws(monkeypatch, ws)
-    _ = _patch_skill_bootstraps(monkeypatch)
+    _ = _patch_workspace_bootstraps(monkeypatch)
 
     with pytest.raises(HTTPException) as exc_info:
         _ = asyncio.run(
@@ -350,7 +362,7 @@ def test_create_agent_rolls_back_when_skill_bootstrap_fails(monkeypatch: MonkeyP
         }
     )
     _patch_ws(monkeypatch, ws)
-    skill_calls = _patch_skill_bootstraps(monkeypatch, fail_skill="document-creation-and-manipulation")
+    skill_calls = _patch_workspace_bootstraps(monkeypatch, fail_skill="document-creation-and-manipulation")
 
     with pytest.raises(HTTPException) as exc_info:
         _ = asyncio.run(
@@ -367,6 +379,44 @@ def test_create_agent_rolls_back_when_skill_bootstrap_fails(monkeypatch: MonkeyP
         ("file-reference-disambiguation", normalize_workspace_for_user("u1", "a2"), "u1"),
         ("response-language", normalize_workspace_for_user("u1", "a2"), "u1"),
         ("document-creation-and-manipulation", normalize_workspace_for_user("u1", "a2"), "u1"),
+    ]
+    assert ws.calls[0][0] == "agents.create"
+    assert ws.calls[1] == ("agents.delete", {"agentId": scoped_id, "deleteFiles": True})
+
+
+def test_create_agent_rolls_back_when_agents_md_bootstrap_fails(monkeypatch: MonkeyPatch):
+    scoped_id = build_user_scoped_agent_id("u1", "Agent 3")
+    workspace = normalize_workspace_for_user("u1", "a3")
+    ws = _FakeWS(
+        responses={
+            "agents.create": {
+                "ok": True,
+                "agentId": scoped_id,
+                "name": scoped_id,
+                "workspace": workspace,
+            },
+            "agents.delete": {"ok": True},
+        }
+    )
+    _patch_ws(monkeypatch, ws)
+    bootstrap_calls = _patch_workspace_bootstraps(monkeypatch, fail_skill="agents-md")
+
+    with pytest.raises(HTTPException) as exc_info:
+        _ = asyncio.run(
+            agents_endpoint.create_agent(
+                AgentCreateRequest(name="Agent 3", workspace="a3"),
+                _user("u1"),
+            )
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "agent skill bootstrap failed"
+    assert bootstrap_calls == [
+        ("share-files", workspace, "u1"),
+        ("file-reference-disambiguation", workspace, "u1"),
+        ("response-language", workspace, "u1"),
+        ("document-creation-and-manipulation", workspace, "u1"),
+        ("agents-md", workspace, "u1"),
     ]
     assert ws.calls[0][0] == "agents.create"
     assert ws.calls[1] == ("agents.delete", {"agentId": scoped_id, "deleteFiles": True})

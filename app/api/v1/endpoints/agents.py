@@ -18,6 +18,7 @@ from app.core.agent_ownership import (
     user_workspace_bases,
 )
 from app.core.agent_share_skill import ensure_share_skill_for_agent
+from app.core.agent_workspace_bootstrap import ensure_agents_md_for_agent
 from app.core.config import settings
 from app.core.openclaw_ws import OpenClawWSClient
 from app.core.security import AuthenticatedUser, get_current_user
@@ -376,11 +377,12 @@ async def create_agent(
         agent_id,
     )
 
-    expected_skill_paths = [
+    expected_bootstrap_paths = [
         f"{effective_workspace.rstrip('/')}/skills/share-files/SKILL.md",
         f"{effective_workspace.rstrip('/')}/skills/file-reference-disambiguation/SKILL.md",
         f"{effective_workspace.rstrip('/')}/skills/response-language/SKILL.md",
         f"{effective_workspace.rstrip('/')}/skills/document-creation-and-manipulation/SKILL.md",
+        f"{effective_workspace.rstrip('/')}/AGENTS.md",
     ]
 
     try:
@@ -398,10 +400,14 @@ async def create_agent(
                 "document-creation-and-manipulation",
                 ensure_document_skill_for_agent(effective_workspace, user_id=user.user_id),
             ),
+            (
+                "agents-md",
+                ensure_agents_md_for_agent(effective_workspace, user_id=user.user_id),
+            ),
         ]:
             logger.info(
                 (
-                    "agents.create agent_skill bootstrap success user_id=%s agent_id=%s "
+                    "agents.create workspace bootstrap success user_id=%s agent_id=%s "
                     "effective_workspace=%s skill_name=%s skill_file=%s"
                 ),
                 user.user_id,
@@ -413,13 +419,13 @@ async def create_agent(
     except Exception as skill_err:  # noqa: BLE001
         logger.exception(
             (
-                "agents.create agent_skill bootstrap failed user_id=%s agent_id=%s "
+                "agents.create workspace bootstrap failed user_id=%s agent_id=%s "
                 "effective_workspace=%s expected_skill_files=%s"
             ),
             user.user_id,
             agent_id,
             effective_workspace,
-            expected_skill_paths,
+            expected_bootstrap_paths,
         )
 
         rollback_error: Optional[Exception] = None
